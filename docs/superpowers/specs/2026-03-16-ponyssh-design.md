@@ -39,12 +39,12 @@ operations are offloaded to short-lived worker actors that return results via
 
 - Single session actor keeps state coordination simple — all protocol
   transitions happen in one actor's sequential execution.
-- Crypto workers prevent expensive operations (key exchange, bulk
-  encryption/decryption) from blocking the session's message processing.
+- Crypto workers prevent expensive operations (key exchange, host key
+  verification) from blocking the session's message processing.
 - Workers communicate via `iso` — no shared mutable state, natural fit for
   Pony's capability system.
-- Scales across cores — key exchange and bulk encryption run on different
-  scheduler threads.
+- Scales across cores — key exchange computations run on different scheduler
+  threads.
 
 **Worker lifecycle:** Workers are short-lived actors created per operation. If
 the session tears down while a worker is in flight, the worker's result is
@@ -84,7 +84,8 @@ class SshSessionContext
   let remote_addr: NetAddress val
   var negotiated_algorithms: (SshAlgorithms val | None) = None
   var authenticated_as: (SshIdentity val | None) = None
-  // grows as connection progresses
+  var session_id: (Array[U8] val | None) = None
+  var server_host_key: (SshHostKey val | None) = None
 ```
 
 This allows consumers to query accumulated information (remote IP, username,
@@ -102,9 +103,14 @@ authenticating key, negotiated algorithms) regardless of current state.
 **In crypto workers (expensive, parallelizable):**
 
 - Key exchange computation (DH/ECDH/Curve25519)
-- Bulk encryption/decryption of packets
-- MAC computation/verification
-- Host key signature verification
+- Host key signature generation/verification
+
+**Inline in the session actor (low-latency path):**
+
+- Per-packet encryption/decryption and MAC — these operations are fast for
+  typical packet sizes and the actor message-passing overhead of offloading
+  them would exceed the crypto cost. Keeping them inline avoids a round-trip
+  to a worker for every packet, which matters for interactive sessions.
 
 ## Package Structure
 
@@ -131,7 +137,7 @@ ponyssh/
 │   │   ├── ssh_publickey.pony
 │   │   └── ssh_none.pony
 │   ├── ssh_connection/      # Connection layer (RFC 4254)
-│   │   ├── ssh_channel.pony # Channel actor + multiplexing logic
+│   │   ├── ssh_channel.pony # Channel state + multiplexing logic
 │   │   └── ssh_manager.pony # Channel lifecycle management
 │   ├── ssh_server/          # Server-facing API
 │   │   └── ssh_listener.pony
@@ -152,7 +158,10 @@ ponyssh/
   Auth and connection logic are internal modules (classes/primitives)
   called by the session, not separate actors.
 - `ssh_server/` and `ssh_client/` are thin public API packages.
-- `_mort.pony` at the top level for panic primitives shared across packages.
+- `_mort.pony` at the top level for panic primitives shared across packages:
+  - `Unreachable` — code paths the compiler can't prove dead but are logically
+    impossible (e.g., `else` after exhaustive size validation)
+  - `IllegalState` — state machine violations, functions called in wrong state
 
 ## Public API
 
@@ -160,18 +169,25 @@ ponyssh/
 
 Consumers interact via actor messaging with notify interfaces. The library
 defines interface traits that specify the behaviors the consumer's actor must
-implement:
+implement. Because these interfaces use `be` (behaviors), conforming types must
+be actors.
 
 ### Client API
 
 ```pony
 interface SshClientNotify
-  be ssh_connected(session: SshSession tag)
-  be ssh_auth_failed(session: SshSession tag, reason: String val)
+  be ssh_ready(session: SshSession tag)
+  be ssh_auth_failed(session: SshSession tag, error: SshAuthError val)
   be ssh_channel_opened(channel: SshChannel tag)
   be ssh_data(channel: SshChannel tag, data: Array[U8] val)
+  be ssh_error(session: SshSession tag, error: SshTransportError val)
   be ssh_disconnected(session: SshSession tag)
 ```
+
+**Lifecycle:** `ssh_ready` fires after authentication succeeds and the session
+enters `SshStateConnected`. The consumer can then open channels. `ssh_error`
+delivers transport-level errors. `ssh_disconnected` fires when the connection
+ends (after error or clean shutdown).
 
 Usage:
 
@@ -184,7 +200,8 @@ actor MyApp is SshClientNotify
       auth' = SshPublicKeyAuth("/path/to/key"))
     SshConnector(env.root, config, this)
 
-  be ssh_connected(session: SshSession tag) => ...
+  be ssh_ready(session: SshSession tag) =>
+    session.open_channel(this)
   be ssh_disconnected(session: SshSession tag) => ...
   // ... etc
 ```
@@ -197,21 +214,35 @@ interface SshServerNotify
   be ssh_auth_request(session: SshSession tag, request: SshAuthRequest val)
   be ssh_channel_opened(session: SshSession tag, channel: SshChannel tag)
   be ssh_data(session: SshSession tag, channel: SshChannel tag, data: Array[U8] val)
+  be ssh_error(session: SshSession tag, error: SshTransportError val)
+  be ssh_disconnected(session: SshSession tag)
 ```
 
 Auth policy is the consumer's responsibility — the consumer inspects
 `SshAuthRequest` and calls `session.auth_accept()` or
 `session.auth_reject(remaining_methods)`.
 
+**Sending data:** The server sends data through the `SshChannel` actor received
+in `ssh_channel_opened`. The same `channel.send(data)` API is used by both
+client and server consumers.
+
 ### Channel API
 
-`SshChannel` is an actor. Consumers send data to it; it handles SSH windowing
-(flow control) transparently:
+`SshChannel` is a class (not an actor) owned by the session. Consumers receive
+a `tag` reference to the session and a channel ID. To send data, consumers call
+a behavior on the session:
 
 ```pony
-channel.send(data)  // send data
-channel.close()     // close channel
+session.channel_send(channel_id, data)  // send data
+session.channel_close(channel_id)       // close channel
 ```
+
+The session handles framing, encryption, and flow control internally. This
+avoids an extra actor hop per data send (consumer → session → TCP, not
+consumer → channel actor → session → TCP).
+
+Internally, `SshChannelManager` tracks per-channel state (window sizes, IDs)
+as a class within the session actor.
 
 ## Crypto Package
 
@@ -243,7 +274,7 @@ class SshCipherContext
 |----------|-----------|
 | Key exchange | curve25519-sha256, ecdh-sha2-nistp256, diffie-hellman-group14-sha256, diffie-hellman-group16-sha512 |
 | Host key | ssh-ed25519, ecdsa-sha2-nistp256, rsa-sha2-256, rsa-sha2-512 |
-| Cipher | chacha20-poly1305@openssh.com, aes256-gcm@openssh.com, aes128-gcm@openssh.com, aes256-ctr, aes128-cbc |
+| Cipher | chacha20-poly1305@openssh.com, aes256-gcm@openssh.com, aes128-gcm@openssh.com, aes256-ctr, aes128-cbc (compatibility only, deprioritized — CVE-2008-5161) |
 | MAC (non-AEAD) | hmac-sha2-256, hmac-sha2-512 |
 
 ### Resource Cleanup
@@ -272,6 +303,18 @@ Two classes owned by the session actor:
   decryption to cipher context when encryption is active.
 - `SshPacketWriter` — frames payload with padding, encrypts if active,
   appends MAC. Returns `Array[U8] iso^`.
+
+Both classes track a `U32` sequence number per direction (send/receive),
+incremented per packet. Sequence numbers are used for MAC computation and
+must trigger mandatory rekeying before wrapping at 2^32 (per RFC 4253
+section 6.4).
+
+**chacha20-poly1305 special handling:** This cipher uses a non-standard packet
+format — the packet length field is encrypted separately with a dedicated key
+derived from the sequence number. `SshPacketReader`/`SshPacketWriter` must
+detect when chacha20-poly1305 is the active cipher and use the alternate
+framing path. This is the only cipher requiring special packet-level treatment;
+all others use the standard format above.
 
 ### Key Exchange
 
@@ -327,12 +370,13 @@ with structured request data and responds with `auth_accept()` or
 
 1. Open request (either side) → session assigns local ID, sends
    `SSH_MSG_CHANNEL_OPEN`
-2. Confirmation → `SshChannel` actor created, consumer notified
-3. Data flows bidirectionally
-4. Either side sends `SSH_MSG_CHANNEL_CLOSE` → channel notifies consumer,
-   becomes inert
+2. Confirmation → channel state created in `SshChannelManager`, consumer
+   notified with channel ID
+3. Data flows bidirectionally via `session.channel_send(channel_id, data)`
+4. Either side sends `SSH_MSG_CHANNEL_CLOSE` → session notifies consumer,
+   channel state removed
 
-`SshChannel` handles `SSH_MSG_CHANNEL_WINDOW_ADJUST` transparently — consumers
+The session handles `SSH_MSG_CHANNEL_WINDOW_ADJUST` transparently — consumers
 do not manage flow control.
 
 ## Error Handling
@@ -394,6 +438,19 @@ notifying the consumer.
 ## Networking
 
 Uses **lori** for TCP networking (not stdlib `net`).
+
+**Integration with session actor:** `SshSession` wraps a lori `TCPConnection`.
+The session actor implements lori's connection callbacks to receive raw bytes,
+which it feeds into `SshPacketReader`. Outbound data from `SshPacketWriter` is
+written to the lori connection.
+
+**Server side:** `SshListener` wraps a lori `TCPListener`. On each accepted
+connection, it creates a new `SshSession` actor with the accepted
+`TCPConnection`.
+
+**Client side:** `SshConnector` creates a lori `TCPConnection` to the target
+host/port. On successful connect, it creates an `SshSession` actor with the
+connection.
 
 ## Testing Strategy
 
