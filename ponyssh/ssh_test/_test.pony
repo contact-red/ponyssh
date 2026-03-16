@@ -16,6 +16,8 @@ actor Main is TestList
     test(_TestCipherDecryptCorrupted)
     test(_TestMacRoundtrip)
     test(_TestMacBitFlip)
+    test(_TestKexCurve25519SharedSecret)
+    test(_TestKexCurve25519InvalidKey)
 
 class iso _TestErrorStrings is UnitTest
   fun name(): String => "ssh_error/error_strings"
