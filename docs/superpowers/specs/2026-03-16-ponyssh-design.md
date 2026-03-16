@@ -143,7 +143,7 @@ ponyssh/
 │   │   └── ssh_listener.pony
 │   ├── ssh_client/          # Client-facing API
 │   │   └── ssh_connector.pony
-│   ├── _mort.pony           # Panic primitives (Unreachable, IllegalState)
+│   ├── ssh_mort/            # Panic primitives (shared across packages)
 │   └── ssh_test/            # Tests
 ├── docs/
 ├── corral.json
@@ -158,9 +158,9 @@ ponyssh/
   Auth and connection logic are internal modules (classes/primitives)
   called by the session, not separate actors.
 - `ssh_server/` and `ssh_client/` are thin public API packages.
-- `_mort.pony` at the top level for panic primitives shared across packages.
-  These print file/line to stderr via FFI and call `@exit(1)` — they are
-  hard aborts, not Pony `error`s:
+- `ssh_mort/` is a proper package (not `_` prefixed) so it can be imported by
+  all other packages. These primitives print file/line to stderr via FFI and
+  call `@exit(1)` — they are hard aborts, not Pony `error`s:
   - `Unreachable` — code paths the compiler can't prove dead but are logically
     impossible (e.g., `else` after exhaustive size validation)
   - `IllegalState` — state machine violations, functions called in wrong state
@@ -178,6 +178,7 @@ be actors.
 
 ```pony
 interface SshClientNotify
+  be ssh_verify_host_key(session: SshSession tag, host: String, key: SshHostKey val)
   be ssh_ready(session: SshSession tag)
   be ssh_auth_failed(session: SshSession tag, error: SshAuthError val)
   be ssh_channel_opened(session: SshSession tag, channel_id: U32)
@@ -218,7 +219,8 @@ actor MyApp is SshClientNotify
 interface SshServerNotify
   be ssh_session_started(session: SshSession tag)
   be ssh_auth_request(session: SshSession tag, request: SshAuthRequest val)
-  be ssh_channel_opened(session: SshSession tag, channel_id: U32)
+  be ssh_session_ready(session: SshSession tag)
+  be ssh_channel_open_request(session: SshSession tag, channel_id: U32, channel_type: String val)
   be ssh_channel_data(session: SshSession tag, channel_id: U32, data: Array[U8] val)
   be ssh_channel_error(session: SshSession tag, channel_id: U32, error: SshChannelError val)
   be ssh_channel_closed(session: SshSession tag, channel_id: U32)
@@ -226,9 +228,30 @@ interface SshServerNotify
   be ssh_disconnected(session: SshSession tag)
 ```
 
+**Lifecycle:** `ssh_session_started` fires when the TCP connection is accepted.
+`ssh_session_ready` fires after authentication succeeds and the session enters
+`SshStateConnected`. `ssh_channel_open_request` fires when a client requests a
+new channel — the consumer responds with `session.accept_channel(channel_id)`
+or `session.reject_channel(channel_id, reason)`.
+
 Auth policy is the consumer's responsibility — the consumer inspects
 `SshAuthRequest` and calls `session.auth_accept()` or
 `session.auth_reject(remaining_methods)`.
+
+### Server Configuration
+
+```pony
+class val SshServerConfig
+  let host_keys: Array[SshHostKeyPair val] val  // at least one required
+  let listen_host: String
+  let listen_port: String
+  let algorithms: (SshAlgorithmPreferences val | None) // None = library defaults
+```
+
+`SshHostKeyPair` holds a private key for signing during key exchange and the
+corresponding public key. The server advertises host key algorithms matching the
+configured key types. Multiple key types can be provided (e.g., Ed25519 + RSA)
+for client compatibility.
 
 ### Channel API
 
@@ -270,7 +293,7 @@ interface val SshCipherAlgorithm
 class SshCipherContext
   // Wraps EVP_CIPHER_CTX
   fun ref encrypt(plaintext: Array[U8] val): Array[U8] iso^
-  fun ref decrypt(ciphertext: Array[U8] val): Array[U8] iso^ ?
+  fun ref decrypt(ciphertext: Array[U8] val): (Array[U8] iso^ | SshCryptoError)
 ```
 
 ### Supported Algorithms
@@ -335,17 +358,22 @@ Key exchange state machine flow:
 Steps 3-5 are offloaded to a crypto worker. The session manages sequencing.
 
 **Host key verification (client side):** During key exchange, the client must
-decide whether to trust the server's host key. `SshClientConfig` accepts an
-`SshHostKeyVerifier` interface:
+decide whether to trust the server's host key. The session calls back to the
+consumer's actor with a verification request:
 
 ```pony
-interface SshHostKeyVerifier
-  fun ref verify(host: String, key: SshHostKey val): Bool
+// Additional callback on SshClientNotify:
+be ssh_verify_host_key(session: SshSession tag, host: String, key: SshHostKey val)
 ```
 
+The consumer inspects the key (e.g., checks a known_hosts database, prompts the
+user) and responds with `session.accept_host_key()` or
+`session.reject_host_key()`. This is async-safe — the consumer can do I/O
+before responding. The session pauses key exchange until a response arrives.
+
 The library provides no built-in known_hosts implementation — the consumer
-supplies the verification policy. If no verifier is provided, the connection
-is rejected (no trust-on-first-use default).
+supplies the verification policy. If the consumer rejects (or never responds
+and the session times out), the connection is terminated.
 
 **Algorithm negotiation:** The selected algorithm is the first entry in the
 client's list that also appears in the server's list (RFC 4253 section 7.1).
@@ -392,17 +420,25 @@ with structured request data and responds with `auth_accept()` or
 
 - Maps local/remote channel IDs
 - Tracks window sizes and enforces flow control
-- Routes incoming data to the correct consumer
+- Demultiplexes incoming data by channel ID for delivery to the consumer
 
 ### Channel Lifecycle
 
-1. Open request (either side) → session assigns local ID, sends
+**Client-initiated open:**
+1. Consumer calls `session.open_channel()` → session sends
    `SSH_MSG_CHANNEL_OPEN`
-2. Confirmation → channel state created in `SshChannelManager`, consumer
-   notified with channel ID
+2. Server confirms → channel state created, consumer notified via
+   `ssh_channel_opened`
 3. Data flows bidirectionally via `session.channel_send(channel_id, data)`
-4. Either side sends `SSH_MSG_CHANNEL_CLOSE` → session notifies consumer,
-   channel state removed
+4. Either side sends `SSH_MSG_CHANNEL_CLOSE` → session notifies consumer via
+   `ssh_channel_closed`, channel state removed
+
+**Server-side handling of client open requests:**
+1. Client sends `SSH_MSG_CHANNEL_OPEN` → session notifies consumer via
+   `ssh_channel_open_request(session, channel_id, channel_type)`
+2. Consumer calls `session.accept_channel(channel_id)` or
+   `session.reject_channel(channel_id, reason)`
+3. If accepted, channel state is created and data flows as above
 
 The session handles `SSH_MSG_CHANNEL_WINDOW_ADJUST` transparently — consumers
 do not manage flow control.
@@ -475,10 +511,12 @@ due to a network failure.
 
 Uses **lori** for TCP networking (not stdlib `net`).
 
-**Integration with session actor:** `SshSession` wraps a lori `TCPConnection`.
-The session actor implements lori's connection callbacks to receive raw bytes,
-which it feeds into `SshPacketReader`. Outbound data from `SshPacketWriter` is
-written to the lori connection.
+**Integration with session actor:** `SshSession` holds a lori `TCPConnection`
+reference (`tag`). A separate notify object (class implementing lori's
+`TCPConnectionNotify`) receives raw bytes and forwards them to the session
+actor via a behavior call. This is standard Pony composition — `SshSession` is
+its own actor, not a subtype of `TCPConnection`. Outbound data from
+`SshPacketWriter` is sent to the `TCPConnection` via its write behavior.
 
 **Server side:** `SshListener` wraps a lori `TCPListener`. On each accepted
 connection, it creates a new `SshSession` actor with the accepted
