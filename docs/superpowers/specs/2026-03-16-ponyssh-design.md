@@ -158,7 +158,9 @@ ponyssh/
   Auth and connection logic are internal modules (classes/primitives)
   called by the session, not separate actors.
 - `ssh_server/` and `ssh_client/` are thin public API packages.
-- `_mort.pony` at the top level for panic primitives shared across packages:
+- `_mort.pony` at the top level for panic primitives shared across packages.
+  These print file/line to stderr via FFI and call `@exit(1)` — they are
+  hard aborts, not Pony `error`s:
   - `Unreachable` — code paths the compiler can't prove dead but are logically
     impossible (e.g., `else` after exhaustive size validation)
   - `IllegalState` — state machine violations, functions called in wrong state
@@ -178,8 +180,10 @@ be actors.
 interface SshClientNotify
   be ssh_ready(session: SshSession tag)
   be ssh_auth_failed(session: SshSession tag, error: SshAuthError val)
-  be ssh_channel_opened(channel: SshChannel tag)
-  be ssh_data(channel: SshChannel tag, data: Array[U8] val)
+  be ssh_channel_opened(session: SshSession tag, channel_id: U32)
+  be ssh_channel_data(session: SshSession tag, channel_id: U32, data: Array[U8] val)
+  be ssh_channel_error(session: SshSession tag, channel_id: U32, error: SshChannelError val)
+  be ssh_channel_closed(session: SshSession tag, channel_id: U32)
   be ssh_error(session: SshSession tag, error: SshTransportError val)
   be ssh_disconnected(session: SshSession tag)
 ```
@@ -187,7 +191,8 @@ interface SshClientNotify
 **Lifecycle:** `ssh_ready` fires after authentication succeeds and the session
 enters `SshStateConnected`. The consumer can then open channels. `ssh_error`
 delivers transport-level errors. `ssh_disconnected` fires when the connection
-ends (after error or clean shutdown).
+ends (after error or clean shutdown). All callbacks include the `session`
+parameter so consumers managing multiple sessions can distinguish them.
 
 Usage:
 
@@ -201,7 +206,8 @@ actor MyApp is SshClientNotify
     SshConnector(env.root, config, this)
 
   be ssh_ready(session: SshSession tag) =>
-    session.open_channel(this)
+    session.open_channel()
+  be ssh_channel_opened(session: SshSession tag, channel_id: U32) => ...
   be ssh_disconnected(session: SshSession tag) => ...
   // ... etc
 ```
@@ -212,8 +218,10 @@ actor MyApp is SshClientNotify
 interface SshServerNotify
   be ssh_session_started(session: SshSession tag)
   be ssh_auth_request(session: SshSession tag, request: SshAuthRequest val)
-  be ssh_channel_opened(session: SshSession tag, channel: SshChannel tag)
-  be ssh_data(session: SshSession tag, channel: SshChannel tag, data: Array[U8] val)
+  be ssh_channel_opened(session: SshSession tag, channel_id: U32)
+  be ssh_channel_data(session: SshSession tag, channel_id: U32, data: Array[U8] val)
+  be ssh_channel_error(session: SshSession tag, channel_id: U32, error: SshChannelError val)
+  be ssh_channel_closed(session: SshSession tag, channel_id: U32)
   be ssh_error(session: SshSession tag, error: SshTransportError val)
   be ssh_disconnected(session: SshSession tag)
 ```
@@ -222,15 +230,11 @@ Auth policy is the consumer's responsibility — the consumer inspects
 `SshAuthRequest` and calls `session.auth_accept()` or
 `session.auth_reject(remaining_methods)`.
 
-**Sending data:** The server sends data through the `SshChannel` actor received
-in `ssh_channel_opened`. The same `channel.send(data)` API is used by both
-client and server consumers.
-
 ### Channel API
 
-`SshChannel` is a class (not an actor) owned by the session. Consumers receive
-a `tag` reference to the session and a channel ID. To send data, consumers call
-a behavior on the session:
+Channels are internal state managed by `SshChannelManager` (a class within the
+session actor). Consumers interact with channels through behaviors on the
+session, identified by `channel_id: U32`:
 
 ```pony
 session.channel_send(channel_id, data)  // send data
@@ -241,8 +245,9 @@ The session handles framing, encryption, and flow control internally. This
 avoids an extra actor hop per data send (consumer → session → TCP, not
 consumer → channel actor → session → TCP).
 
-Internally, `SshChannelManager` tracks per-channel state (window sizes, IDs)
-as a class within the session actor.
+Channel events are delivered to the consumer via the notify interface:
+`ssh_channel_opened`, `ssh_channel_data`, `ssh_channel_error`,
+`ssh_channel_closed`.
 
 ## Crypto Package
 
@@ -329,12 +334,35 @@ Key exchange state machine flow:
 
 Steps 3-5 are offloaded to a crypto worker. The session manages sequencing.
 
+**Host key verification (client side):** During key exchange, the client must
+decide whether to trust the server's host key. `SshClientConfig` accepts an
+`SshHostKeyVerifier` interface:
+
+```pony
+interface SshHostKeyVerifier
+  fun ref verify(host: String, key: SshHostKey val): Bool
+```
+
+The library provides no built-in known_hosts implementation — the consumer
+supplies the verification policy. If no verifier is provided, the connection
+is rejected (no trust-on-first-use default).
+
 **Algorithm negotiation:** The selected algorithm is the first entry in the
 client's list that also appears in the server's list (RFC 4253 section 7.1).
 This is a pure function.
 
 **Rekeying:** After `SSH_MSG_NEWKEYS`, the session swaps in new cipher/MAC
-contexts atomically, consuming the old ones.
+contexts atomically, consuming the old ones. Rekeying is triggered when any of
+these thresholds is reached:
+- Sequence number approaches 2^32 (mandatory per RFC 4253 section 6.4)
+- 1 GB of data transferred in either direction (recommended per RFC 4253
+  section 9)
+- Either side sends `SSH_MSG_KEXINIT` (the other side must respond)
+
+**Maximum packet size:** 35000 bytes per RFC 4253 section 6.1. Packets
+exceeding this are rejected with `SshPacketTooLarge`. This limit is enforced in
+`SshPacketReader` before decryption to prevent denial-of-service via oversized
+packets.
 
 ## Authentication Layer
 
@@ -384,56 +412,64 @@ do not manage flow control.
 Each package defines its own error vocabulary as a union type. Higher layers
 wrap lower-layer errors to preserve full context.
 
+Error types that wrap inner errors are classes (holding the inner error as a
+field). Simple leaf errors with no inner data are primitives. All error types
+implement `string(): String val`.
+
 ### Crypto Errors
 
 ```pony
 type SshCryptoError is
-  ( SshDecryptFailed
-  | SshMacMismatch
-  | SshSignatureInvalid
-  | SshKeyInvalid
-  | SshOpenSSLError )
+  ( SshDecryptFailed       // primitive
+  | SshMacMismatch         // primitive
+  | SshSignatureInvalid    // primitive
+  | SshKeyInvalid          // primitive
+  | SshOpenSSLError )      // class — wraps OpenSSL error code + message
 ```
 
 ### Transport Errors
 
 ```pony
 type SshTransportError is
-  ( SshPacketTooLarge
-  | SshPacketCorrupt
-  | SshKexFailed val
-  | SshAlgorithmNegotiationFailed
-  | SshProtocolVersionMismatch
-  | SshConnectionLost )
+  ( SshPacketTooLarge              // primitive
+  | SshPacketCorrupt               // primitive
+  | SshKexFailed                   // class — wraps SshCryptoError
+  | SshAlgorithmNegotiationFailed  // primitive
+  | SshProtocolVersionMismatch     // primitive
+  | SshConnectionLost )            // primitive
 ```
 
 ### Auth Errors
 
 ```pony
 type SshAuthError is
-  ( SshAuthRejected
-  | SshAuthProtocolError
-  | SshAuthCryptoError val )
+  ( SshAuthRejected        // primitive
+  | SshAuthProtocolError   // primitive
+  | SshAuthCryptoError )   // class — wraps SshCryptoError
 ```
 
 ### Channel Errors
 
 ```pony
 type SshChannelError is
-  ( SshChannelOpenFailed
-  | SshChannelClosed
-  | SshWindowExhausted )
+  ( SshChannelOpenFailed   // primitive
+  | SshChannelClosed       // primitive
+  | SshWindowExhausted )   // primitive
 ```
 
-Each error primitive implements `string(): String val`. Wrapping errors expose
-the inner error for programmatic inspection.
-
-**Consumer delivery:** The session translates internal errors into behaviors on
-the consumer's notify interface (e.g., `ssh_disconnected(session, error)`).
+**Consumer delivery:** Errors are delivered to consumers via the notify
+interface. Transport/session errors go to `ssh_error`. Channel errors go to
+`ssh_channel_error`. Auth failures go to `ssh_auth_failed`. All error values
+are sent as `val` so they can cross actor boundaries.
 
 **Protocol disconnects:** When SSH protocol requires `SSH_MSG_DISCONNECT`, the
 session sends the message before transitioning to `SshStateDisconnected` and
-notifying the consumer.
+notifying the consumer via `ssh_disconnected`.
+
+**TCP connection closure:** When lori reports connection closed, the session
+transitions to `SshStateDisconnected` and notifies the consumer. This is the
+same path regardless of whether the close was initiated locally, remotely, or
+due to a network failure.
 
 ## Networking
 
@@ -450,7 +486,9 @@ connection, it creates a new `SshSession` actor with the accepted
 
 **Client side:** `SshConnector` creates a lori `TCPConnection` to the target
 host/port. On successful connect, it creates an `SshSession` actor with the
-connection.
+connection. `SshConnector` does not handle DNS resolution, retries, or
+connection timeouts beyond what lori provides — the consumer is responsible for
+retry logic.
 
 ## Testing Strategy
 
