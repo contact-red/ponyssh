@@ -195,19 +195,47 @@ delivers transport-level errors. `ssh_disconnected` fires when the connection
 ends (after error or clean shutdown). All callbacks include the `session`
 parameter so consumers managing multiple sessions can distinguish them.
 
+### Client Configuration
+
+```pony
+class val SshClientConfig
+  let host: String
+  let port: String
+  let auth_methods: Array[SshAuthMethod val] val  // tried in order
+  let algorithms: (SshAlgorithmPreferences val | None)  // None = library defaults
+```
+
+`SshAuthMethod` is a union type:
+
+```pony
+type SshAuthMethod is (SshPublicKeyAuth | SshPasswordAuth | SshNoneAuth)
+
+class val SshPublicKeyAuth
+  let private_key_path: String  // PEM file path
+
+class val SshPasswordAuth
+  let password: String
+
+primitive SshNoneAuth
+```
+
 Usage:
 
 ```pony
 actor MyApp is SshClientNotify
   new create(env: Env) =>
+    let auth_methods = recover val
+      [as SshAuthMethod: SshPublicKeyAuth("/path/to/key")]
+    end
     let config = SshClientConfig(where
       host' = "example.com",
       port' = "22",
-      auth' = SshPublicKeyAuth("/path/to/key"))
+      auth_methods' = auth_methods,
+      algorithms' = None)
     SshConnector(env.root, config, this)
 
   be ssh_ready(session: SshSession tag) =>
-    session.open_channel()
+    session.open_channel("session")
   be ssh_channel_opened(session: SshSession tag, channel_id: U32) => ...
   be ssh_disconnected(session: SshSession tag) => ...
   // ... etc
@@ -357,19 +385,12 @@ Key exchange state machine flow:
 
 Steps 3-5 are offloaded to a crypto worker. The session manages sequencing.
 
-**Host key verification (client side):** During key exchange, the client must
-decide whether to trust the server's host key. The session calls back to the
-consumer's actor with a verification request:
-
-```pony
-// Additional callback on SshClientNotify:
-be ssh_verify_host_key(session: SshSession tag, host: String, key: SshHostKey val)
-```
-
-The consumer inspects the key (e.g., checks a known_hosts database, prompts the
-user) and responds with `session.accept_host_key()` or
-`session.reject_host_key()`. This is async-safe — the consumer can do I/O
-before responding. The session pauses key exchange until a response arrives.
+**Host key verification (client side):** During key exchange, the session calls
+`ssh_verify_host_key` on the consumer's `SshClientNotify`. The consumer inspects
+the key (e.g., checks a known_hosts database, prompts the user) and responds
+with `session.accept_host_key()` or `session.reject_host_key()`. This is
+async-safe — the consumer can do I/O before responding. The session pauses key
+exchange until a response arrives.
 
 The library provides no built-in known_hosts implementation — the consumer
 supplies the verification policy. If the consumer rejects (or never responds
@@ -386,6 +407,12 @@ these thresholds is reached:
 - 1 GB of data transferred in either direction (recommended per RFC 4253
   section 9)
 - Either side sends `SSH_MSG_KEXINIT` (the other side must respond)
+
+**Channel data during rekeying:** The session queues outbound channel data while
+rekeying is in progress and flushes it after `SSH_MSG_NEWKEYS` completes.
+Inbound channel data received during rekeying is still decryptable with the old
+keys (they remain active until `NEWKEYS`) and is delivered normally. This is
+transparent to consumers.
 
 **Maximum packet size:** 35000 bytes per RFC 4253 section 6.1. Packets
 exceeding this are rejected with `SshPacketTooLarge`. This limit is enforced in
@@ -425,7 +452,7 @@ with structured request data and responds with `auth_accept()` or
 ### Channel Lifecycle
 
 **Client-initiated open:**
-1. Consumer calls `session.open_channel()` → session sends
+1. Consumer calls `session.open_channel("session")` → session sends
    `SSH_MSG_CHANNEL_OPEN`
 2. Server confirms → channel state created, consumer notified via
    `ssh_channel_opened`
@@ -488,7 +515,7 @@ type SshAuthError is
 
 ```pony
 type SshChannelError is
-  ( SshChannelOpenFailed   // primitive
+  ( SshChannelOpenFailed   // class — wraps RFC 4254 reason code + description
   | SshChannelClosed       // primitive
   | SshWindowExhausted )   // primitive
 ```
@@ -518,9 +545,13 @@ actor via a behavior call. This is standard Pony composition — `SshSession` is
 its own actor, not a subtype of `TCPConnection`. Outbound data from
 `SshPacketWriter` is sent to the `TCPConnection` via its write behavior.
 
-**Server side:** `SshListener` wraps a lori `TCPListener`. On each accepted
-connection, it creates a new `SshSession` actor with the accepted
-`TCPConnection`.
+**Server side:** `SshListener` wraps a lori `TCPListener`. The consumer passes
+a single actor implementing `SshServerNotify` to `SshListener`. On each
+accepted connection, the listener creates a new `SshSession` actor with the
+accepted `TCPConnection`, and all sessions call back to the same notify actor.
+The `session: SshSession tag` parameter on every callback lets the consumer
+distinguish sessions. If the consumer needs per-session state, it maintains a
+map from `SshSession tag` to session-specific data.
 
 **Client side:** `SshConnector` creates a lori `TCPConnection` to the target
 host/port. On successful connect, it creates an `SshSession` actor with the
