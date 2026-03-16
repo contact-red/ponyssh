@@ -26,6 +26,10 @@ actor Main is TestList
     test(_TestPacketPadding)
     test(_TestPacketTooLarge)
     test(_TestPacketSequenceNumbers)
+    test(_TestAlgoNegotiateFirstMatch)
+    test(_TestAlgoNegotiateNoOverlap)
+    test(_TestAlgoNegotiateIdenticalLists)
+    test(_TestAlgoNegotiateDefaults)
 
 class iso _TestErrorStrings is UnitTest
   fun name(): String => "ssh_error/error_strings"
