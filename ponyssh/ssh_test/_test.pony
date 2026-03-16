@@ -14,6 +14,8 @@ actor Main is TestList
     test(_TestErrorStrings)
     test(_TestCipherRoundtrip)
     test(_TestCipherDecryptCorrupted)
+    test(_TestMacRoundtrip)
+    test(_TestMacBitFlip)
 
 class iso _TestErrorStrings is UnitTest
   fun name(): String => "ssh_error/error_strings"
