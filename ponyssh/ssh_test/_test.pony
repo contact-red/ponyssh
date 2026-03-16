@@ -1,5 +1,7 @@
 use "pony_test"
+use "pony_check"
 use "../ssh_error"
+use "../ssh_crypto"
 
 actor Main is TestList
   new create(env: Env) =>
@@ -10,6 +12,8 @@ actor Main is TestList
 
   fun tag tests(test: PonyTest) =>
     test(_TestErrorStrings)
+    test(_TestCipherRoundtrip)
+    test(_TestCipherDecryptCorrupted)
 
 class iso _TestErrorStrings is UnitTest
   fun name(): String => "ssh_error/error_strings"
