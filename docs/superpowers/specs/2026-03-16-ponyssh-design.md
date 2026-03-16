@@ -143,7 +143,7 @@ ponyssh/
 │   │   └── ssh_listener.pony
 │   ├── ssh_client/          # Client-facing API
 │   │   └── ssh_connector.pony
-│   ├── ssh_mort/            # Panic primitives (shared across packages)
+│   ├── ssh_error/           # Error types and impossible-state handling
 │   └── ssh_test/            # Tests
 ├── docs/
 ├── corral.json
@@ -158,12 +158,13 @@ ponyssh/
   Auth and connection logic are internal modules (classes/primitives)
   called by the session, not separate actors.
 - `ssh_server/` and `ssh_client/` are thin public API packages.
-- `ssh_mort/` is a proper package (not `_` prefixed) so it can be imported by
-  all other packages. These primitives print file/line to stderr via FFI and
-  call `@exit(1)` — they are hard aborts, not Pony `error`s:
-  - `Unreachable` — code paths the compiler can't prove dead but are logically
-    impossible (e.g., `else` after exhaustive size validation)
-  - `IllegalState` — state machine violations, functions called in wrong state
+- `ssh_error/` holds shared error types and impossible-state handling.
+  When the session reaches a state that should be logically impossible
+  (e.g., a code path the compiler can't prove dead, or a state machine
+  violation), it does **not** abort the process — it sends
+  `SSH_MSG_DISCONNECT` with reason code `SSH_DISCONNECT_PROTOCOL_ERROR`,
+  tears down the connection, and notifies the consumer via `ssh_error`
+  followed by `ssh_disconnected`. A library must never kill the host process.
 
 ## Public API
 
