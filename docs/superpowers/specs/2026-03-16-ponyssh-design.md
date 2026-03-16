@@ -212,10 +212,10 @@ class val SshClientConfig
 type SshAuthMethod is (SshPublicKeyAuth | SshPasswordAuth | SshNoneAuth)
 
 class val SshPublicKeyAuth
-  let private_key_path: String  // PEM file path
+  let private_key_data: Array[U8] val  // PEM-encoded private key contents
 
 class val SshPasswordAuth
-  let password: String
+  let password: String val
 
 primitive SshNoneAuth
 ```
@@ -226,7 +226,7 @@ Usage:
 actor MyApp is SshClientNotify
   new create(env: Env) =>
     let auth_methods = recover val
-      [as SshAuthMethod: SshPublicKeyAuth("/path/to/key")]
+      [as SshAuthMethod: SshPublicKeyAuth(key_data)]
     end
     let config = SshClientConfig(where
       host' = "example.com",
@@ -271,16 +271,16 @@ Auth policy is the consumer's responsibility — the consumer inspects
 
 ```pony
 class val SshServerConfig
-  let host_keys: Array[SshHostKeyPair val] val  // at least one required
+  let host_keys: Array[SshHostKeyPair val] val  // at least one required; key data, not file paths
   let listen_host: String
   let listen_port: String
   let algorithms: (SshAlgorithmPreferences val | None) // None = library defaults
 ```
 
-`SshHostKeyPair` holds a private key for signing during key exchange and the
-corresponding public key. The server advertises host key algorithms matching the
-configured key types. Multiple key types can be provided (e.g., Ed25519 + RSA)
-for client compatibility.
+`SshHostKeyPair` holds key material as `Array[U8] val` (PEM-encoded contents,
+not file paths). The consumer is responsible for reading key files. The server
+advertises host key algorithms matching the configured key types. Multiple key
+types can be provided (e.g., Ed25519 + RSA) for client compatibility.
 
 ### Channel API
 
