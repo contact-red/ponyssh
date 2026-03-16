@@ -2,6 +2,7 @@ use "pony_test"
 use "pony_check"
 use "../ssh_error"
 use "../ssh_crypto"
+use "../ssh_transport"
 
 actor Main is TestList
   new create(env: Env) =>
@@ -21,6 +22,10 @@ actor Main is TestList
     test(_TestHostKeySignVerify)
     test(_TestHostKeySignVerifyCorrupted)
     test(_TestHostKeyPublicKeySize)
+    test(_TestPacketRoundtripPlaintext)
+    test(_TestPacketPadding)
+    test(_TestPacketTooLarge)
+    test(_TestPacketSequenceNumbers)
 
 class iso _TestErrorStrings is UnitTest
   fun name(): String => "ssh_error/error_strings"
