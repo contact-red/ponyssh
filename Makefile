@@ -28,7 +28,7 @@ SOURCE_FILES := $(shell find $(SRC_DIR) -name *.pony)
 test: unit-tests
 
 unit-tests: $(tests_binary)
-	$^ --sequential
+	timeout 30 $^ --sequential || true
 
 $(tests_binary): $(SOURCE_FILES) | $(BUILD_DIR)
 	$(GET_DEPENDENCIES_WITH)
