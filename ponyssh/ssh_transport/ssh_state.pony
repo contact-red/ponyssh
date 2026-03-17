@@ -20,6 +20,7 @@ class SshStateKeyExchange
   var shared_secret: (Array[U8] val | None) = None
   var exchange_hash: (Array[U8] val | None) = None
   var awaiting_host_key_verification: Bool = false
+  var our_kex: (SshKexCurve25519 | None) = None
 
   new create(our_kexinit': Array[U8] val, their_kexinit': Array[U8] val,
     negotiated': SshNegotiatedAlgorithms val)

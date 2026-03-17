@@ -140,6 +140,29 @@ class ref SshCipherContext
     end
     @EVP_CIPHER_CTX_set_padding(ctx, 0)
 
+  fun ref set_aad(aad: Array[U8] val) ? =>
+    """
+    Set additional authenticated data for AEAD ciphers (GCM).
+    Must be called before encrypt/decrypt.
+    """
+    var aad_len: I32 = 0
+    let rc = if _encrypting then
+      @EVP_EncryptUpdate(
+        _ctx,
+        Pointer[U8],
+        addressof aad_len,
+        aad.cpointer(),
+        aad.size().i32())
+    else
+      @EVP_DecryptUpdate(
+        _ctx,
+        Pointer[U8],
+        addressof aad_len,
+        aad.cpointer(),
+        aad.size().i32())
+    end
+    if rc != 1 then error end
+
   fun ref encrypt(plaintext: Array[U8] val, is_aead: Bool = true): Array[U8] val =>
     let out_size = plaintext.size() + 16
     let out = recover iso Array[U8].init(0, out_size) end

@@ -48,6 +48,10 @@ actor Main is TestList
     test(_TestChannelDataSendWindowTracking)
     test(_TestChannelClose)
     test(_TestChannelFindByRemoteId)
+    test(_TestEncryptedPacketRoundtrip)
+    test(_TestEncryptedPacketCorrupted)
+    test(_TestEncryptedPacketLargePayload)
+    test(_TestIntegrationHandshake)
 
 class iso _TestErrorStrings is UnitTest
   fun name(): String => "ssh_error/error_strings"

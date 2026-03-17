@@ -2,6 +2,8 @@ primitive SshMsgTypes
   fun disconnect(): U8 => 1
   fun kexinit(): U8 => 20
   fun newkeys(): U8 => 21
+  fun kex_ecdh_init(): U8 => 30
+  fun kex_ecdh_reply(): U8 => 31
 
 primitive SshDisconnectCodes
   fun host_not_allowed(): U32 => 1
@@ -80,3 +82,19 @@ primitive SshMessages
 
   fun newkeys(): Array[U8] val =>
     recover val [as U8: SshMsgTypes.newkeys()] end
+
+  fun kex_ecdh_init(client_public: Array[U8] val): Array[U8] val =>
+    let w = SshWireWriter
+    w.write_byte(SshMsgTypes.kex_ecdh_init())
+    w.write_string(client_public)
+    w.val_bytes()
+
+  fun kex_ecdh_reply(host_key_blob: Array[U8] val, server_public: Array[U8] val,
+    signature: Array[U8] val): Array[U8] val
+  =>
+    let w = SshWireWriter
+    w.write_byte(SshMsgTypes.kex_ecdh_reply())
+    w.write_string(host_key_blob)
+    w.write_string(server_public)
+    w.write_string(signature)
+    w.val_bytes()

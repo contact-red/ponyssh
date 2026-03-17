@@ -54,6 +54,8 @@ actor SshSession
   var _prefs: SshAlgorithmPreferences val = SshDefaultAlgorithms.preferences()
   var _kex: (SshKexStateMachine | None) = None
   var _auth: (SshAuthStateMachine | None) = None
+  var _host_key: (SshHostKeyPair | None) = None
+  var _our_kexinit: (Array[U8] val | None) = None
 
   let _version_string: String val = "SSH-2.0-ponyssh_0.1"
 
@@ -81,6 +83,7 @@ actor SshSession
     end
     _kex = SshKexStateMachine(SshRoleServer)
     _auth = None
+    try _host_key = SshHostKeyPair.create(config.host_key_pem)? end
     // Bridge set separately via _set_bridge
 
   be _set_bridge(bridge: SshServerTcpBridge tag) =>
@@ -124,10 +127,12 @@ actor SshSession
     end
 
   be accept_host_key() =>
+    // NEWKEYS was already sent when the signature was verified.
+    // This just clears the awaiting flag. If we've already transitioned
+    // to Auth (received server's NEWKEYS), this is a no-op.
     match _state
     | let s: SshStateKeyExchange =>
       s.awaiting_host_key_verification = false
-      // TODO: implement continuation after host key verification
     end
 
   be reject_host_key() =>
@@ -240,9 +245,42 @@ actor SshSession
   fun ref _handle_version_exchange(state: SshStateHandshake) =>
     """
     Parse the remote version string from the buffered data.
-    Stub -- will be completed with integration tests.
+    Version exchange is raw line-based text before packet framing begins.
+    Lines not starting with "SSH-" are pre-auth banners (ignored per RFC 4253).
+    The version line must start with "SSH-2.0-".
     """
-    None
+    while true do
+      match _reader.read_line()
+      | let line: String val =>
+        if line.substring(0, 4) == "SSH-" then
+          // This is the version string
+          if line.substring(0, 8) != "SSH-2.0-" then
+            _disconnect_with_error(SshProtocolVersionMismatch)
+            return
+          end
+          _context.remote_version = line
+          // Send our KEXINIT and transition to key exchange
+          match _kex
+          | let kex: SshKexStateMachine =>
+            let our_kexinit = kex.generate_kexinit(_prefs)
+            _our_kexinit = our_kexinit
+            _send_packet(our_kexinit)
+            // Transition to KeyExchange state. We don't yet have their KEXINIT,
+            // so create the state with placeholder empty arrays and negotiated.
+            // The real negotiation happens when we receive their KEXINIT.
+            let empty: Array[U8] val = recover val Array[U8] end
+            let placeholder_neg = SshNegotiatedAlgorithms("", "", "", "", "", "")
+            _state = SshStateKeyExchange(our_kexinit, empty, placeholder_neg)
+          end
+          // Try processing any remaining buffered data as packets
+          _process_packets()
+          return
+        end
+        // Non-SSH lines are pre-auth banners, skip them
+      | None =>
+        return  // Not enough data yet
+      end
+    end
 
   fun ref _dispatch_packet(payload: Array[U8] val) =>
     """Route a decrypted payload to the appropriate handler based on state."""
@@ -266,9 +304,65 @@ actor SshSession
         match kex.receive_kexinit(payload, _prefs)
         | let neg: SshNegotiatedAlgorithms val =>
           _context.negotiated_algorithms = neg
-          // TODO: Start DH/ECDH exchange
+          // Update state with their KEXINIT and negotiated algorithms
+          let our_ki = match _our_kexinit
+          | let ki: Array[U8] val => ki
+          else
+            recover val Array[U8] end
+          end
+          _state = SshStateKeyExchange(our_ki, payload, neg)
+          // Client initiates ECDH after receiving server's KEXINIT
+          match _role
+          | SshRoleClient =>
+            try
+              let client_kex = SshKexCurve25519.create()?
+              let client_pub = client_kex.public_key()
+              // Store kex object in state for later use
+              match _state
+              | let s: SshStateKeyExchange =>
+                s.our_kex = client_kex
+              end
+              _send_packet(SshMessages.kex_ecdh_init(client_pub))
+            else
+              _disconnect_with_error(SshKexFailed(SshKeyInvalid))
+            end
+          end
         | let err: SshTransportError =>
           _disconnect_with_error(err)
+        end
+      end
+    | SshMsgTypes.kex_ecdh_init() =>
+      // Server receives client's public key
+      match _role
+      | SshRoleServer =>
+        match _state
+        | let s: SshStateKeyExchange =>
+          try
+            let r = SshWireReader(payload)
+            r.read_byte()?  // msg type
+            let client_pub = r.read_string()?
+            _server_handle_ecdh_init(s, client_pub)
+          else
+            _disconnect_with_error(SshKexFailed(SshKeyInvalid))
+          end
+        end
+      end
+    | SshMsgTypes.kex_ecdh_reply() =>
+      // Client receives server's reply
+      match _role
+      | SshRoleClient =>
+        match _state
+        | let s: SshStateKeyExchange =>
+          try
+            let r = SshWireReader(payload)
+            r.read_byte()?  // msg type
+            let host_key_blob = r.read_string()?
+            let server_pub = r.read_string()?
+            let signature = r.read_string()?
+            _client_handle_ecdh_reply(s, host_key_blob, server_pub, signature)
+          else
+            _disconnect_with_error(SshKexFailed(SshKeyInvalid))
+          end
         end
       end
     | SshMsgTypes.newkeys() =>
@@ -282,6 +376,138 @@ actor SshSession
       | SshRoleClient =>
         _send_packet(SshAuthMessages.service_request("ssh-userauth"))
       end
+    end
+
+  fun ref _server_handle_ecdh_init(s: SshStateKeyExchange,
+    client_pub: Array[U8] val)
+  =>
+    """
+    Server handles SSH_MSG_KEX_ECDH_INIT: generate keypair, compute shared
+    secret, compute exchange hash, sign it, send reply + NEWKEYS.
+    """
+    try
+      let server_kex = SshKexCurve25519.create()?
+      let server_pub = server_kex.public_key()
+
+      match server_kex.derive_shared_secret(client_pub)
+      | let shared_secret: Array[U8] val =>
+        // Compute simplified exchange hash: SHA-256(client_pub || server_pub || shared_secret)
+        let hash_input = recover val
+          let buf = Array[U8]
+          for b in client_pub.values() do buf.push(b) end
+          for b in server_pub.values() do buf.push(b) end
+          for b in shared_secret.values() do buf.push(b) end
+          buf
+        end
+        let exchange_hash = SshHash.sha256(hash_input)
+
+        // Set session_id (first exchange hash per RFC 4253)
+        if _context.session_id is None then
+          _context.session_id = exchange_hash
+        end
+
+        // Build host key blob and sign the exchange hash
+        match _host_key
+        | let hk: SshHostKeyPair =>
+          let pub_key = hk.public_key()
+          // Host key blob: string("ssh-ed25519") || string(public_key_data)
+          let host_key_blob = recover val
+            let w = SshWireWriter
+            w.write_string_from_str(pub_key.algorithm)
+            w.write_string(pub_key.public_key_data)
+            w.val_bytes()
+          end
+
+          match hk.sign(exchange_hash)
+          | let raw_sig: Array[U8] val =>
+            // Signature blob: string("ssh-ed25519") || string(raw_signature)
+            let sig_blob = recover val
+              let w = SshWireWriter
+              w.write_string_from_str(pub_key.algorithm)
+              w.write_string(raw_sig)
+              w.val_bytes()
+            end
+
+            _send_packet(SshMessages.kex_ecdh_reply(host_key_blob, server_pub,
+              sig_blob))
+            _send_packet(SshMessages.newkeys())
+          | let err: SshCryptoError =>
+            _disconnect_with_error(SshKexFailed(err))
+          end
+        else
+          _disconnect_with_error(SshKexFailed(SshKeyInvalid))
+        end
+      | let err: SshCryptoError =>
+        _disconnect_with_error(SshKexFailed(err))
+      end
+    else
+      _disconnect_with_error(SshKexFailed(SshKeyInvalid))
+    end
+
+  fun ref _client_handle_ecdh_reply(s: SshStateKeyExchange,
+    host_key_blob: Array[U8] val, server_pub: Array[U8] val,
+    signature: Array[U8] val)
+  =>
+    """
+    Client handles SSH_MSG_KEX_ECDH_REPLY: compute shared secret,
+    compute exchange hash, verify signature, request host key verification.
+    """
+    match s.our_kex
+    | let client_kex: SshKexCurve25519 =>
+      let client_pub = client_kex.public_key()
+      match client_kex.derive_shared_secret(server_pub)
+      | let shared_secret: Array[U8] val =>
+        // Same simplified exchange hash as server
+        let hash_input = recover val
+          let buf = Array[U8]
+          for b in client_pub.values() do buf.push(b) end
+          for b in server_pub.values() do buf.push(b) end
+          for b in shared_secret.values() do buf.push(b) end
+          buf
+        end
+        let exchange_hash = SshHash.sha256(hash_input)
+
+        // Set session_id
+        if _context.session_id is None then
+          _context.session_id = exchange_hash
+        end
+
+        // Parse host key blob to get SshHostKey
+        try
+          let kr = SshWireReader(host_key_blob)
+          let algo = kr.read_string_as_str()?
+          let pk_data = kr.read_string()?
+          let host_key = SshHostKey(algo, pk_data)
+          _context.server_host_key = host_key
+
+          // Verify the signature on the exchange hash
+          // Parse signature blob: string(algo) || string(raw_sig)
+          let sr = SshWireReader(signature)
+          let sig_algo = sr.read_string_as_str()?
+          let raw_sig = sr.read_string()?
+
+          match SshHostKeyVerify.verify(host_key, raw_sig, exchange_hash)
+          | true =>
+            // Signature valid, send NEWKEYS immediately
+            _send_packet(SshMessages.newkeys())
+            // Notify consumer for host key verification (accept/reject
+            // controls whether auth proceeds after we receive server NEWKEYS)
+            s.awaiting_host_key_verification = true
+            match _client_notify
+            | let n: SshClientNotify tag =>
+              n.ssh_verify_host_key(this, "", host_key)
+            end
+          | let err: SshCryptoError =>
+            _disconnect_with_error(SshKexFailed(err))
+          end
+        else
+          _disconnect_with_error(SshKexFailed(SshKeyInvalid))
+        end
+      | let err: SshCryptoError =>
+        _disconnect_with_error(SshKexFailed(err))
+      end
+    else
+      _disconnect_with_error(SshKexFailed(SshKeyInvalid))
     end
 
   fun ref _handle_auth(msg_type: U8, payload: Array[U8] val) =>
@@ -312,9 +538,52 @@ actor SshSession
         end
       end
     | SshAuthMsgTypes.userauth_request() =>
-      // Server side: decode and forward to consumer
-      // TODO: decode auth request and forward
-      None
+      match _role
+      | SshRoleServer =>
+        try
+          let r = SshWireReader(payload)
+          r.read_byte()?  // msg type
+          let username = r.read_string_as_str()?
+          let service = r.read_string_as_str()?
+          let method = r.read_string_as_str()?
+          let method_data: SshAuthMethodData val = match method
+          | "none" => SshAuthNoneData
+          | "password" =>
+            r.read_bool()?  // new_password flag (ignore)
+            SshAuthPasswordData(r.read_string_as_str()?)
+          | "publickey" =>
+            let has_sig = r.read_bool()?
+            let algo = r.read_string_as_str()?
+            let pk = r.read_string()?
+            let sig = if has_sig then r.read_string()? else None end
+            SshAuthPublicKeyData(algo, pk, sig)
+          else
+            SshAuthNoneData  // Unknown method treated as none
+          end
+          let request = SshAuthRequest(username, method, method_data)
+          match _server_notify
+          | let n: SshServerNotify tag => n.ssh_auth_request(this, request)
+          end
+        end
+      end
+    | SshAuthMsgTypes.service_accept() =>
+      // Client received service_accept, send first auth request
+      match _role
+      | SshRoleClient =>
+        match _auth
+        | let auth_sm: SshAuthStateMachine =>
+          match auth_sm.next_request()
+          | let req: Array[U8] val =>
+            _send_packet(req)
+          | SshAuthRejected =>
+            match _client_notify
+            | let n: SshClientNotify tag =>
+              n.ssh_auth_failed(this, SshAuthRejected)
+            end
+            _disconnect_with_error(SshConnectionLost)
+          end
+        end
+      end
     | SshAuthMsgTypes.service_request() =>
       match _role
       | SshRoleServer =>
