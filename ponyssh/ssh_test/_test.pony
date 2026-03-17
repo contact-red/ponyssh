@@ -51,6 +51,9 @@ actor Main is TestList
     test(_TestEncryptedPacketRoundtrip)
     test(_TestEncryptedPacketCorrupted)
     test(_TestEncryptedPacketLargePayload)
+    test(_TestChacha20Poly1305Roundtrip)
+    test(_TestChacha20Poly1305SequenceNumberMatters)
+    test(_TestChacha20Poly1305Corrupted)
     test(_TestIntegrationHandshake)
 
 class iso _TestErrorStrings is UnitTest
