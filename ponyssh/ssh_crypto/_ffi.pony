@@ -60,6 +60,20 @@ use @HMAC[Pointer[U8] tag](
 use @EVP_sha256[Pointer[None] tag]()
 use @EVP_sha512[Pointer[None] tag]()
 
+// Message digest
+use @EVP_DigestInit_ex[I32](
+  ctx: Pointer[None] tag,
+  type': Pointer[None] tag,
+  impl: Pointer[None] tag)
+use @EVP_DigestUpdate[I32](
+  ctx: Pointer[None] tag,
+  d: Pointer[U8] tag,
+  cnt: USize)
+use @EVP_DigestFinal_ex[I32](
+  ctx: Pointer[None] tag,
+  md: Pointer[U8] tag,
+  s: Pointer[U32] tag)
+
 // Key exchange (EVP_PKEY)
 use @EVP_PKEY_CTX_new_id[Pointer[None] tag](id: I32, e: Pointer[None] tag)
 use @EVP_PKEY_keygen_init[I32](ctx: Pointer[None] tag)

@@ -34,6 +34,9 @@ actor Main is TestList
     test(_TestWireStringRoundtrip)
     test(_TestWireNameListRoundtrip)
     test(_TestKexinitRoundtrip)
+    test(_TestKexGenerateKexinit)
+    test(_TestKexReceiveAndNegotiate)
+    test(_TestKexDeriveKeys)
 
 class iso _TestErrorStrings is UnitTest
   fun name(): String => "ssh_error/error_strings"
