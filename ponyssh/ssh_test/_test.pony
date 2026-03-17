@@ -3,6 +3,7 @@ use "pony_check"
 use "../ssh_error"
 use "../ssh_crypto"
 use "../ssh_transport"
+use "../ssh_auth"
 
 actor Main is TestList
   new create(env: Env) =>
@@ -37,6 +38,9 @@ actor Main is TestList
     test(_TestKexGenerateKexinit)
     test(_TestKexReceiveAndNegotiate)
     test(_TestKexDeriveKeys)
+    test(_TestAuthMessageEncode)
+    test(_TestAuthStateMachineTriesMethods)
+    test(_TestAuthFailureDecode)
 
 class iso _TestErrorStrings is UnitTest
   fun name(): String => "ssh_error/error_strings"
