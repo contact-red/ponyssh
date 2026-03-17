@@ -600,22 +600,30 @@ actor SshSession
           (keys.enc_key_s2c, keys.iv_s2c, keys.enc_key_c2s, keys.iv_c2s)
         end
 
-        // Truncate IV to 4 bytes (the fixed field for AES-256-GCM per RFC 5647)
-        let write_iv_fixed = recover val
-          let b = Array[U8].create(4)
-          try b.push(write_iv(0)?); b.push(write_iv(1)?)
-                b.push(write_iv(2)?); b.push(write_iv(3)?) end
+        // Use first 12 bytes of derived IV as the full GCM IV.
+        // OpenSSH uses EVP_CTRL_GCM_SET_IV_FIXED with the full 12-byte IV,
+        // then increments the last 8 bytes per packet.
+        let write_iv_12 = recover val
+          let b = Array[U8].create(12)
+          var i: USize = 0
+          while i < 12 do
+            try b.push(write_iv(i)?) end
+            i = i + 1
+          end
           b
         end
-        let read_iv_fixed = recover val
-          let b = Array[U8].create(4)
-          try b.push(read_iv(0)?); b.push(read_iv(1)?)
-                b.push(read_iv(2)?); b.push(read_iv(3)?) end
+        let read_iv_12 = recover val
+          let b = Array[U8].create(12)
+          var i: USize = 0
+          while i < 12 do
+            try b.push(read_iv(i)?) end
+            i = i + 1
+          end
           b
         end
 
-        _writer.set_gcm_params(write_key, write_iv_fixed)
-        _reader.set_gcm_params(read_key, read_iv_fixed)
+        _writer.set_gcm_params(write_key, write_iv_12)
+        _reader.set_gcm_params(read_key, read_iv_12)
         _encrypted = true
       end
     end

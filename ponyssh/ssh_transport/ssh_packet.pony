@@ -5,27 +5,29 @@ class SshPacketWriter
   var _sequence_number: U32 = 0
   var _encrypt_ctx: (SshCipherContext | None) = None
   var _is_aead: Bool = false
-  // Per-packet GCM state: key + 4-byte fixed IV prefix
+  // Per-packet GCM state: key + 12-byte IV (last 8 bytes incremented per packet)
   var _gcm_key: (Array[U8] val | None) = None
-  var _gcm_iv_fixed: (Array[U8] val | None) = None
-  var _gcm_counter: U64 = 0
+  var _gcm_iv: (Array[U8] ref | None) = None
 
   fun ref set_encrypt_ctx(ctx: SshCipherContext, is_aead: Bool = true) =>
     _encrypt_ctx = ctx
     _is_aead = is_aead
 
-  fun ref set_gcm_params(key: Array[U8] val, iv_fixed: Array[U8] val) =>
-    """Set up per-packet GCM encryption. A fresh cipher context is created per packet."""
+  fun ref set_gcm_params(key: Array[U8] val, iv: Array[U8] val) =>
+    """
+    Set up per-packet GCM encryption. A fresh cipher context is created per
+    packet. iv must be 12 bytes. The last 8 bytes are incremented per packet.
+    """
     _gcm_key = key
-    _gcm_iv_fixed = iv_fixed
-    _gcm_counter = 0
-    // Set a dummy encrypt_ctx so the write path knows we're encrypting
+    let iv_copy = Array[U8].create(12)
+    for b in iv.values() do iv_copy.push(b) end
+    _gcm_iv = iv_copy
     _is_aead = true
 
   fun ref clear_encrypt_ctx() =>
     _encrypt_ctx = None
     _gcm_key = None
-    _gcm_iv_fixed = None
+    _gcm_iv = None
 
   fun ref write(payload: Array[U8] val, block_size: USize = 8): Array[U8] iso^ =>
     """
@@ -34,18 +36,25 @@ class SshPacketWriter
     """
     // Calculate padding:
     // packet_length = 1 (padding_length field) + payload.size() + padding
-    // total = 4 (packet_length field) + packet_length
-    // total must be multiple of block_size
     // padding must be >= 4 and < 256
-    let min_packet_len = 1 + payload.size() + 4
-    let total = 4 + min_packet_len
-    let padding = if (total % block_size) == 0 then
-      USize(4)
+    //
+    // Alignment depends on cipher mode:
+    // - Plaintext / non-AEAD: (4 + packet_length) must be multiple of block_size
+    //   because the packet_length field is encrypted along with the body
+    // - AEAD (GCM): packet_length itself must be multiple of block_size
+    //   because the 4-byte length is plaintext AAD, not part of the encrypted block
+    let actual_padding = if _is_aead then
+      // AEAD: align packet_length to block_size
+      let min_pkt_len = 1 + payload.size() + 4  // with minimum 4 padding
+      let rem = min_pkt_len % block_size
+      if rem == 0 then USize(4) else 4 + (block_size - rem) end
     else
-      4 + (block_size - (total % block_size))
+      // Plaintext / non-AEAD: align (4 + packet_length) to block_size
+      let min_pkt_len = 1 + payload.size() + 4
+      let total = 4 + min_pkt_len
+      let rem = total % block_size
+      if rem == 0 then USize(4) else 4 + (block_size - rem) end
     end
-    // Ensure padding < 256
-    let actual_padding = if padding >= 256 then padding % block_size else padding end
 
     let packet_length = (1 + payload.size() + actual_padding).u32()
 
@@ -68,24 +77,18 @@ class SshPacketWriter
 
     _sequence_number = _sequence_number + 1
 
-    // Per-packet GCM: create a fresh cipher context for each packet
-    match (_gcm_key, _gcm_iv_fixed)
-    | (let key: Array[U8] val, let iv_fixed: Array[U8] val) =>
+    // Per-packet GCM: create a fresh cipher context with the current IV,
+    // then increment the IV's last 8 bytes for the next packet.
+    // This matches OpenSSH's EVP_CTRL_GCM_IV_GEN behavior.
+    match (_gcm_key, _gcm_iv)
+    | (let key: Array[U8] val, let gcm_iv: Array[U8] ref) =>
       let plaintext: Array[U8] val = consume result
-      let iv = recover val
-        let b = Array[U8].create(12)
-        try
-          b.push(iv_fixed(0)?); b.push(iv_fixed(1)?)
-          b.push(iv_fixed(2)?); b.push(iv_fixed(3)?)
-        end
-        let ctr = _gcm_counter
-        b.push((ctr >> 56).u8()); b.push((ctr >> 48).u8())
-        b.push((ctr >> 40).u8()); b.push((ctr >> 32).u8())
-        b.push((ctr >> 24).u8()); b.push((ctr >> 16).u8())
-        b.push((ctr >> 8).u8()); b.push(ctr.u8())
-        b
-      end
-      _gcm_counter = _gcm_counter + 1
+      // Snapshot the current IV as iso then consume to val
+      let iv_iso = recover iso Array[U8].create(12) end
+      for b in gcm_iv.values() do iv_iso.push(b) end
+      let iv: Array[U8] val = consume iv_iso
+      // Increment the last 8 bytes of the mutable IV for the next packet
+      _increment_iv(gcm_iv)
       let pkt_len_bytes: Array[U8] val = recover val
         let b = Array[U8].create(4)
         try
@@ -180,6 +183,18 @@ class SshPacketWriter
       consume result
     end
 
+  fun ref _increment_iv(iv: Array[U8] ref) =>
+    """Increment the last 8 bytes of a 12-byte IV as a big-endian counter."""
+    try
+      var i: USize = iv.size() - 1
+      while i >= 4 do
+        let v = iv(i)? + 1
+        iv(i)? = v
+        if v != 0 then return end  // no carry
+        i = i - 1
+      end
+    end
+
   fun sequence_number(): U32 => _sequence_number
 
 class SshPacketReader
@@ -188,10 +203,9 @@ class SshPacketReader
   var _decrypt_ctx: (SshCipherContext | None) = None
   var _mac_digest_len: USize = 0
   var _is_aead: Bool = false
-  // Per-packet GCM state
+  // Per-packet GCM state: key + 12-byte IV (last 8 bytes incremented per packet)
   var _gcm_key: (Array[U8] val | None) = None
-  var _gcm_iv_fixed: (Array[U8] val | None) = None
-  var _gcm_counter: U64 = 0
+  var _gcm_iv: (Array[U8] ref | None) = None
 
   fun ref set_decrypt_ctx(
     ctx: SshCipherContext,
@@ -202,11 +216,15 @@ class SshPacketReader
     _mac_digest_len = mac_digest_len
     _is_aead = is_aead
 
-  fun ref set_gcm_params(key: Array[U8] val, iv_fixed: Array[U8] val) =>
-    """Set up per-packet GCM decryption. A fresh cipher context is created per packet."""
+  fun ref set_gcm_params(key: Array[U8] val, iv: Array[U8] val) =>
+    """
+    Set up per-packet GCM decryption. A fresh cipher context is created per
+    packet. iv must be 12 bytes. The last 8 bytes are incremented per packet.
+    """
     _gcm_key = key
-    _gcm_iv_fixed = iv_fixed
-    _gcm_counter = 0
+    let iv_copy = Array[U8].create(12)
+    for b in iv.values() do iv_copy.push(b) end
+    _gcm_iv = iv_copy
     _mac_digest_len = 16
     _is_aead = true
 
@@ -214,7 +232,7 @@ class SshPacketReader
     _decrypt_ctx = None
     _mac_digest_len = 0
     _gcm_key = None
-    _gcm_iv_fixed = None
+    _gcm_iv = None
 
   fun ref append(data: Array[U8] val) =>
     """Append incoming TCP bytes to the internal buffer."""
@@ -228,27 +246,18 @@ class SshPacketReader
     - SshTransportError on protocol error
     - None if not enough data yet
     """
-    // Per-packet GCM: create a fresh cipher context for each packet
-    match (_gcm_key, _gcm_iv_fixed)
-    | (let key: Array[U8] val, let iv_fixed: Array[U8] val) =>
-      let iv = recover val
-        let b = Array[U8].create(12)
-        try
-          b.push(iv_fixed(0)?); b.push(iv_fixed(1)?)
-          b.push(iv_fixed(2)?); b.push(iv_fixed(3)?)
-        end
-        let ctr = _gcm_counter
-        b.push((ctr >> 56).u8()); b.push((ctr >> 48).u8())
-        b.push((ctr >> 40).u8()); b.push((ctr >> 32).u8())
-        b.push((ctr >> 24).u8()); b.push((ctr >> 16).u8())
-        b.push((ctr >> 8).u8()); b.push(ctr.u8())
-        b
-      end
+    // Per-packet GCM: create a fresh cipher context with the current IV,
+    // then increment the IV's last 8 bytes for the next packet.
+    match (_gcm_key, _gcm_iv)
+    | (let key: Array[U8] val, let gcm_iv: Array[U8] ref) =>
+      let iv_iso = recover iso Array[U8].create(12) end
+      for b in gcm_iv.values() do iv_iso.push(b) end
+      let iv: Array[U8] val = consume iv_iso
       try
         let ctx = SshCipherContext.aes_256_gcm(key, iv, false)?
         let result = _read_aead(ctx)
         match result
-        | let _: Array[U8] val => _gcm_counter = _gcm_counter + 1
+        | let _: Array[U8] val => _increment_iv(gcm_iv)
         end
         return result
       else
@@ -455,5 +464,17 @@ class SshPacketReader
       i = i + 1
     end
     None
+
+  fun ref _increment_iv(iv: Array[U8] ref) =>
+    """Increment the last 8 bytes of a 12-byte IV as a big-endian counter."""
+    try
+      var i: USize = iv.size() - 1
+      while i >= 4 do
+        let v = iv(i)? + 1
+        iv(i)? = v
+        if v != 0 then return end
+        i = i - 1
+      end
+    end
 
   fun sequence_number(): U32 => _sequence_number

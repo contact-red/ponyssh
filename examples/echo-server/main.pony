@@ -47,9 +47,30 @@ actor EchoServerNotify is SshServerNotify
     _env.out.print("New connection")
 
   be ssh_auth_request(session: SshSession tag, request: SshAuthRequest val) =>
-    _env.out.print("Auth from: " + request.username)
-    _last_username = request.username
-    session.auth_accept()
+    _env.out.print("Auth from: " + request.username + " (" + request.method + ")")
+    match request.method_data
+    | let pw: SshAuthPasswordData val =>
+      if pw.password == "wibble" then
+        _last_username = request.username
+        session.auth_accept()
+      else
+        _env.out.print("  wrong password")
+        let remaining = recover val
+          let a = Array[String val]
+          a.push("password")
+          a
+        end
+        session.auth_reject(remaining)
+      end
+    else
+      // Reject non-password methods, tell client to use password
+      let remaining = recover val
+        let a = Array[String val]
+        a.push("password")
+        a
+      end
+      session.auth_reject(remaining)
+    end
 
   be ssh_session_ready(session: SshSession tag) => None
 
