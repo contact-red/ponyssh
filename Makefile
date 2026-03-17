@@ -15,10 +15,12 @@ ifdef config
 	endif
 endif
 
+ssl ?= 3.0.x
+
 ifeq ($(config),release)
-	PONYC = $(COMPILE_WITH)
+	PONYC = $(COMPILE_WITH) -D openssl_$(ssl)
 else
-	PONYC = $(COMPILE_WITH) --debug
+	PONYC = $(COMPILE_WITH) --debug -D openssl_$(ssl)
 endif
 
 SOURCE_FILES := $(shell find $(SRC_DIR) -name *.pony)

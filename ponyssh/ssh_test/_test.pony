@@ -5,6 +5,7 @@ use "../ssh_crypto"
 use "../ssh_transport"
 use "../ssh_auth"
 use "../ssh_connection"
+use "../ssh_client"
 
 actor Main is TestList
   new create(env: Env) =>
