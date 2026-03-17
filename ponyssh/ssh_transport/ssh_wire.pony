@@ -1,31 +1,27 @@
+use "buffered"
+
 class ref SshWireWriter
   """Accumulates SSH wire format bytes. Call val_bytes() to get the final val bytes."""
-  var _buf: Array[U8] trn
-
-  new create() =>
-    _buf = recover trn Array[U8] end
+  let _w: Writer ref = Writer
 
   fun ref write_byte(value: U8) =>
-    _buf.push(value)
+    _w.u8(value)
 
   fun ref write_bool(value: Bool) =>
-    _buf.push(if value then 1 else 0 end)
+    _w.u8(if value then 1 else 0 end)
 
   fun ref write_u32(value: U32) =>
-    _buf.push((value >> 24).u8())
-    _buf.push((value >> 16).u8())
-    _buf.push((value >> 8).u8())
-    _buf.push(value.u8())
+    _w.u32_be(value)
 
   fun ref write_string(value: Array[U8] val) =>
     """SSH string: uint32 length followed by data bytes."""
-    write_u32(value.size().u32())
-    for b in value.values() do _buf.push(b) end
+    _w.u32_be(value.size().u32())
+    _w.write(value)
 
   fun ref write_string_from_str(value: String val) =>
     """SSH string from Pony String."""
-    write_u32(value.size().u32())
-    for b in value.values() do _buf.push(b) end
+    _w.u32_be(value.size().u32())
+    _w.write(value.array())
 
   fun ref write_name_list(names: Array[String val] val) =>
     """SSH name-list: comma-separated string."""
@@ -35,61 +31,58 @@ class ref SshWireWriter
   fun ref write_mpint(value: Array[U8] val) =>
     """SSH mpint: uint32 length + big-endian bytes, with leading zero if high bit set."""
     if value.size() == 0 then
-      write_u32(0)
+      _w.u32_be(0)
     else
       try
         if (value(0)? and 0x80) != 0 then
-          // Need leading zero byte
-          write_u32((value.size() + 1).u32())
-          _buf.push(0)
+          _w.u32_be((value.size() + 1).u32())
+          _w.u8(0)
         else
-          write_u32(value.size().u32())
+          _w.u32_be(value.size().u32())
         end
       end
-      for b in value.values() do _buf.push(b) end
+      _w.write(value)
     end
 
   fun ref val_bytes(): Array[U8] val =>
-    """Freeze accumulated bytes into a sendable val array."""
-    let b: Array[U8] val = _buf = recover trn Array[U8] end
-    b
+    """Collect all chunks into a single contiguous Array[U8] val."""
+    let chunks: Array[ByteSeq] val = _w.done()
+    var total: USize = 0
+    for chunk in chunks.values() do
+      total = total + match chunk
+      | let a: Array[U8] val => a.size()
+      | let s: String => s.size()
+      end
+    end
+    let out = recover iso Array[U8](total) end
+    for chunk in chunks.values() do
+      match chunk
+      | let a: Array[U8] val => for b in a.values() do out.push(b) end
+      | let s: String => for b in s.values() do out.push(b) end
+      end
+    end
+    consume out
 
 class SshWireReader
-  let _data: Array[U8] val
-  var _offset: USize = 0
+  let _r: Reader ref
 
   new create(data: Array[U8] val) =>
-    _data = data
+    _r = Reader
+    _r.append(data)
 
   fun ref read_byte(): U8 ? =>
-    let v = _data(_offset)?
-    _offset = _offset + 1
-    v
+    _r.u8()?
 
   fun ref read_bool(): Bool ? =>
-    read_byte()? != 0
+    _r.u8()? != 0
 
   fun ref read_u32(): U32 ? =>
-    let b0 = _data(_offset)?.u32()
-    let b1 = _data(_offset + 1)?.u32()
-    let b2 = _data(_offset + 2)?.u32()
-    let b3 = _data(_offset + 3)?.u32()
-    _offset = _offset + 4
-    (b0 << 24) or (b1 << 16) or (b2 << 8) or b3
+    _r.u32_be()?
 
   fun ref read_string(): Array[U8] val ? =>
-    let len = read_u32()?.usize()
-    let result = recover val
-      let arr = Array[U8].create(len)
-      var i: USize = 0
-      while i < len do
-        arr.push(_data(_offset + i)?)
-        i = i + 1
-      end
-      arr
-    end
-    _offset = _offset + len
-    result
+    let len = _r.u32_be()?.usize()
+    let block = _r.block(len)?
+    consume block
 
   fun ref read_string_as_str(): String val ? =>
     let bytes = read_string()?
@@ -102,7 +95,7 @@ class SshWireReader
     else
       let parts = s.split(",")
       recover val
-        let arr = Array[String val].create(parts.size())
+        let arr = Array[String val](parts.size())
         for p in (consume parts).values() do
           arr.push(consume p)
         end
@@ -128,4 +121,4 @@ class SshWireReader
     end
 
   fun remaining(): USize =>
-    if _offset > _data.size() then 0 else _data.size() - _offset end
+    _r.size()

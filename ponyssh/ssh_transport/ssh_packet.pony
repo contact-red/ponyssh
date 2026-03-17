@@ -1,3 +1,4 @@
+use "buffered"
 use "../ssh_error"
 use "../ssh_crypto"
 
@@ -80,19 +81,20 @@ class SshPacketWriter
     let packet_length = (1 + payload.size() + actual_padding).u32()
 
     let result = recover iso
-      let buf = Array[U8].create(4 + packet_length.usize())
-      // Write packet_length as big-endian U32
-      buf.push((packet_length >> 24).u8())
-      buf.push((packet_length >> 16).u8())
-      buf.push((packet_length >> 8).u8())
-      buf.push(packet_length.u8())
-      // Write padding_length
-      buf.push(actual_padding.u8())
-      // Write payload
-      for b in payload.values() do buf.push(b) end
-      // Write random padding
+      let w = Writer
+      w.u32_be(packet_length)
+      w.u8(actual_padding.u8())
+      w.write(payload)
       let pad = SshRandom.random_bytes(actual_padding)
-      for b in (consume pad).values() do buf.push(b) end
+      w.write(consume pad)
+      let chunks = w.done()
+      let buf = Array[U8].create(4 + packet_length.usize())
+      for chunk in (consume chunks).values() do
+        match chunk
+        | let a: Array[U8] val => for b in a.values() do buf.push(b) end
+        | let s: String => for b in s.values() do buf.push(b) end
+        end
+      end
       buf
     end
 
@@ -253,7 +255,7 @@ class SshPacketWriter
   fun sequence_number(): U32 => _sequence_number
 
 class SshPacketReader
-  var _buffer: Array[U8] = Array[U8]
+  let _buf: Reader = Reader
   var _sequence_number: U32 = 0
   var _is_aead: Bool = false
   // Per-packet GCM state
@@ -316,7 +318,7 @@ class SshPacketReader
 
   fun ref append(data: Array[U8] val) =>
     """Append incoming TCP bytes to the internal buffer."""
-    for b in data.values() do _buffer.push(b) end
+    _buf.append(data)
 
   fun ref read(): (Array[U8] val | SshTransportError | None) =>
     """
@@ -372,56 +374,38 @@ class SshPacketReader
     Read an AEAD-encrypted packet (GCM).
     Format: packet_length(4, cleartext) || encrypted_body(packet_length) || tag(mac_digest_len)
     """
-    // Need at least 4 bytes for packet_length
-    if _buffer.size() < 4 then return None end
+    if _buf.size() < 4 then return None end
 
-    // Read packet_length (big-endian U32) — cleartext for AEAD
-    let packet_length = try
-      ((_buffer(0)?.u32() << 24) or
-       (_buffer(1)?.u32() << 16) or
-       (_buffer(2)?.u32() << 8) or
-        _buffer(3)?.u32())
-    else
-      return SshPacketCorrupt
-    end
+    // Peek at packet_length (big-endian U32) — cleartext for AEAD
+    let packet_length = try _buf.peek_u32_be()? else return SshPacketCorrupt end
 
     if packet_length.usize() > 35000 then
       return SshPacketTooLarge
     end
 
     let total_needed = 4 + packet_length.usize() + _mac_digest_len
-    if _buffer.size() < total_needed then return None end
+    if _buf.size() < total_needed then return None end
 
-    // Extract packet_length bytes (AAD)
-    let pkt_len_bytes_iso = recover iso
-      let b = Array[U8].create(4)
-      b.push((packet_length >> 24).u8())
-      b.push((packet_length >> 16).u8())
-      b.push((packet_length >> 8).u8())
-      b.push(packet_length.u8())
-      b
+    // Now consume: packet_length bytes (AAD)
+    let pkt_len_bytes: Array[U8] val = try
+      _buf.block(4)?
+    else
+      return SshPacketCorrupt
     end
-    let pkt_len_bytes: Array[U8] val = consume pkt_len_bytes_iso
 
-    // Extract ciphertext (packet_length bytes after the 4-byte header)
-    let ct_buf = recover iso Array[U8].create(packet_length.usize()) end
-    var j: USize = 4
-    let ct_end = 4 + packet_length.usize()
-    while j < ct_end do
-      try ct_buf.push(_buffer(j)?) end
-      j = j + 1
+    // Read ciphertext (packet_length bytes after the 4-byte header)
+    let ciphertext: Array[U8] val = try
+      _buf.block(packet_length.usize())?
+    else
+      return SshPacketCorrupt
     end
-    let ciphertext: Array[U8] val = consume ct_buf
 
-    // Extract GCM tag (mac_digest_len bytes after ciphertext)
-    let tag_buf = recover iso Array[U8].create(_mac_digest_len) end
-    j = 4 + packet_length.usize()
-    let tag_end = j + _mac_digest_len
-    while j < tag_end do
-      try tag_buf.push(_buffer(j)?) end
-      j = j + 1
+    // Read GCM tag
+    let gcm_tag: Array[U8] val = try
+      _buf.block(_mac_digest_len)?
+    else
+      return SshPacketCorrupt
     end
-    let gcm_tag: Array[U8] val = consume tag_buf
 
     // Set AAD and GCM tag, then decrypt
     try ctx.set_aad(pkt_len_bytes)? else return SshPacketCorrupt end
@@ -451,15 +435,6 @@ class SshPacketReader
     end
     let payload: Array[U8] val = consume p
 
-    // Consume the packet from the buffer
-    let new_buffer = Array[U8].create(_buffer.size() - total_needed)
-    i = total_needed
-    while i < _buffer.size() do
-      try new_buffer.push(_buffer(i)?) end
-      i = i + 1
-    end
-    _buffer = new_buffer
-
     _sequence_number = _sequence_number + 1
     payload
 
@@ -475,15 +450,14 @@ class SshPacketReader
     match _decrypted_first_block
     | None =>
       // Need at least one cipher block
-      if _buffer.size() < _block_size then return None end
+      if _buf.size() < _block_size then return None end
       // Extract and decrypt first block
-      let first_block_enc = recover iso Array[U8].create(_block_size) end
-      var i: USize = 0
-      while i < _block_size do
-        try first_block_enc.push(_buffer(i)?) end
-        i = i + 1
+      let first_block_enc: Array[U8] val = try
+        _buf.block(_block_size)?
+      else
+        return SshPacketCorrupt
       end
-      let first_block = ctx.decrypt_stream(consume first_block_enc)
+      let first_block = ctx.decrypt_stream(first_block_enc)
       // Extract packet_length from first 4 bytes
       let pkt_len = try
         (first_block(0)?.u32() << 24) or (first_block(1)?.u32() << 16) or
@@ -497,10 +471,13 @@ class SshPacketReader
     end
 
     // Step 2: Check if we have enough data for the full packet + MAC
+    // Note: first block is already consumed from _buf, so remaining needed is
+    // (total_encrypted - _block_size) + _mac_digest_len
     let pkt_len = _first_block_packet_length
     let total_encrypted = 4 + pkt_len.usize()  // packet_length field + body
-    let total_needed = total_encrypted + _mac_digest_len
-    if _buffer.size() < total_needed then return None end
+    let remaining_encrypted = total_encrypted - _block_size
+    let remaining_needed = remaining_encrypted + _mac_digest_len
+    if _buf.size() < remaining_needed then return None end
 
     // Step 3: Decrypt remaining encrypted bytes (after first block)
     let first_block = match _decrypted_first_block
@@ -510,15 +487,13 @@ class SshPacketReader
     end
     _decrypted_first_block = None
 
-    let remaining_enc_size = total_encrypted - _block_size
-    let remaining_dec = if remaining_enc_size > 0 then
-      let enc_rest = recover iso Array[U8].create(remaining_enc_size) end
-      var j: USize = _block_size
-      while j < total_encrypted do
-        try enc_rest.push(_buffer(j)?) end
-        j = j + 1
+    let remaining_dec = if remaining_encrypted > 0 then
+      let enc_rest: Array[U8] val = try
+        _buf.block(remaining_encrypted)?
+      else
+        return SshPacketCorrupt
       end
-      ctx.decrypt_stream(consume enc_rest)
+      ctx.decrypt_stream(enc_rest)
     else
       recover val Array[U8] end
     end
@@ -532,13 +507,11 @@ class SshPacketReader
     let plaintext: Array[U8] val = consume plaintext_iso
 
     // Step 5: Extract and verify HMAC
-    let received_mac_iso = recover iso Array[U8].create(_mac_digest_len) end
-    var k: USize = total_encrypted
-    while k < total_needed do
-      try received_mac_iso.push(_buffer(k)?) end
-      k = k + 1
+    let received_mac: Array[U8] val = try
+      _buf.block(_mac_digest_len)?
+    else
+      return SshPacketCorrupt
     end
-    let received_mac: Array[U8] val = consume received_mac_iso
 
     // Compute expected MAC: HMAC(key, seq_number_BE || plaintext_packet)
     let mac_input_iso = recover iso Array[U8].create(4 + plaintext.size()) end
@@ -574,110 +547,47 @@ class SshPacketReader
     end
     let payload: Array[U8] val = consume p
 
-    // Consume from buffer
-    let new_buffer = Array[U8].create(_buffer.size() - total_needed)
-    var n: USize = total_needed
-    while n < _buffer.size() do
-      try new_buffer.push(_buffer(n)?) end
-      n = n + 1
-    end
-    _buffer = new_buffer
-
     _sequence_number = _sequence_number + 1
     payload
 
   fun ref _read_plaintext(): (Array[U8] val | SshTransportError | None) =>
     """Read an unencrypted packet."""
-    // Need at least 4 bytes for packet_length
-    if _buffer.size() < 4 then return None end
+    if _buf.size() < 4 then return None end
 
-    // Read packet_length (big-endian U32)
-    let packet_length = try
-      ((_buffer(0)?.u32() << 24) or
-       (_buffer(1)?.u32() << 16) or
-       (_buffer(2)?.u32() << 8) or
-        _buffer(3)?.u32())
-    else
-      return SshPacketCorrupt
-    end
+    // Peek at packet_length (big-endian U32)
+    let packet_length = try _buf.peek_u32_be()? else return SshPacketCorrupt end
 
-    // Check max packet size (35000 per RFC 4253 section 6.1)
     if packet_length.usize() > 35000 then
       return SshPacketTooLarge
     end
 
     let total_needed = 4 + packet_length.usize()
-    if _buffer.size() < total_needed then return None end
+    if _buf.size() < total_needed then return None end
 
-    // Extract the packet data
-    let padding_length = try _buffer(4)? else return SshPacketCorrupt end
-    let payload_length = packet_length.usize() - 1 - padding_length.usize()
-
-    // Validate padding
-    if padding_length.usize() < 4 then return SshPacketCorrupt end
-    if (1 + payload_length + padding_length.usize()) != packet_length.usize() then
-      return SshPacketCorrupt
+    // Now consume
+    try
+      _buf.skip(4)?  // packet_length field (already peeked)
+      let padding_length = _buf.u8()?
+      let payload_length = packet_length.usize() - 1 - padding_length.usize()
+      if padding_length.usize() < 4 then return SshPacketCorrupt end
+      let payload: Array[U8] val = _buf.block(payload_length)?
+      _buf.skip(padding_length.usize())?  // discard padding
+      _sequence_number = _sequence_number + 1
+      payload
+    else
+      SshPacketCorrupt
     end
-
-    // Copy buffer contents we need before modifying it
-    // Extract payload (bytes 5 through 5+payload_length)
-    let p = recover iso Array[U8].create(payload_length) end
-    var i: USize = 5
-    let end_i = 5 + payload_length
-    while i < end_i do
-      try p.push(_buffer(i)?) end
-      i = i + 1
-    end
-    let payload: Array[U8] val = consume p
-
-    // Consume the packet from the buffer by rebuilding without consumed bytes
-    let new_buffer = Array[U8].create(_buffer.size() - total_needed)
-    i = total_needed
-    while i < _buffer.size() do
-      try new_buffer.push(_buffer(i)?) end
-      i = i + 1
-    end
-    _buffer = new_buffer
-
-    _sequence_number = _sequence_number + 1
-    payload
 
   fun ref read_line(): (String val | None) =>
     """
     Scan the buffer for a line ending in \n. Returns the line content without
     the trailing \r\n (or \n), or None if no complete line yet.
     """
-    var i: USize = 0
-    while i < _buffer.size() do
-      try
-        if _buffer(i)? == '\n' then
-          // Found newline. Build the line (excluding \r\n or \n).
-          let end_pos = if (i > 0) and (_buffer(i - 1)? == '\r') then
-            i - 1
-          else
-            i
-          end
-          // Copy line bytes out of buffer first
-          let line_bytes = recover iso Array[U8].create(end_pos) end
-          var j: USize = 0
-          while j < end_pos do
-            line_bytes.push(_buffer(j)?)
-            j = j + 1
-          end
-          // Consume the line + newline from the buffer
-          let new_buffer = Array[U8].create(_buffer.size() - (i + 1))
-          var k: USize = i + 1
-          while k < _buffer.size() do
-            new_buffer.push(_buffer(k)?)
-            k = k + 1
-          end
-          _buffer = new_buffer
-          return String.from_array(consume line_bytes)
-        end
-      end
-      i = i + 1
+    try
+      _buf.line()?
+    else
+      None
     end
-    None
 
   fun ref _increment_iv(iv: Array[U8] ref) =>
     """Increment the last 8 bytes of a 12-byte IV as a big-endian counter."""
