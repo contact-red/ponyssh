@@ -1,6 +1,12 @@
 {
   "packages": [
     "ponyssh/ssh_error",
+    "ponyssh/ssh_crypto",
+    "ponyssh/ssh_transport",
+    "ponyssh/ssh_auth",
+    "ponyssh/ssh_connection",
+    "ponyssh/ssh_client",
+    "ponyssh/ssh_server",
     "ponyssh/ssh_test"
   ],
   "deps": [
