@@ -30,6 +30,10 @@ actor Main is TestList
     test(_TestAlgoNegotiateNoOverlap)
     test(_TestAlgoNegotiateIdenticalLists)
     test(_TestAlgoNegotiateDefaults)
+    test(_TestWireU32Roundtrip)
+    test(_TestWireStringRoundtrip)
+    test(_TestWireNameListRoundtrip)
+    test(_TestKexinitRoundtrip)
 
 class iso _TestErrorStrings is UnitTest
   fun name(): String => "ssh_error/error_strings"
