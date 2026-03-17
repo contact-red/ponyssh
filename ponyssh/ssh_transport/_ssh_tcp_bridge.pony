@@ -1,6 +1,6 @@
 use "lori"
 
-actor _SshClientTcpBridge is (TCPConnectionActor & ClientLifecycleEventReceiver)
+actor SshClientTcpBridge is (TCPConnectionActor & ClientLifecycleEventReceiver)
   var _tcp_connection: TCPConnection = TCPConnection.none()
   let _session: SshSession tag
 
@@ -30,7 +30,7 @@ actor _SshClientTcpBridge is (TCPConnectionActor & ClientLifecycleEventReceiver)
   be close() =>
     _connection().close()
 
-actor _SshServerTcpBridge is (TCPConnectionActor & ServerLifecycleEventReceiver)
+actor SshServerTcpBridge is (TCPConnectionActor & ServerLifecycleEventReceiver)
   var _tcp_connection: TCPConnection = TCPConnection.none()
   let _session: SshSession tag
 

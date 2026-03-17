@@ -4,7 +4,7 @@ use "../ssh_crypto"
 use "../ssh_auth"
 use "../ssh_connection"
 
-type _SshBridge is (_SshClientTcpBridge tag | _SshServerTcpBridge tag)
+type _SshBridge is (SshClientTcpBridge tag | SshServerTcpBridge tag)
 
 class val SshClientConfig
   let host: String val
@@ -27,12 +27,18 @@ class val SshClientConfig
 
 class val SshServerConfig
   let host_key_pem: Array[U8] val
+  let listen_host: String val
+  let listen_port: String val
   let algorithms: (SshAlgorithmPreferences val | None)
 
   new val create(host_key_pem': Array[U8] val,
+    listen_host': String val = "127.0.0.1",
+    listen_port': String val = "22",
     algorithms': (SshAlgorithmPreferences val | None) = None)
   =>
     host_key_pem = host_key_pem'
+    listen_host = listen_host'
+    listen_port = listen_port'
     algorithms = algorithms'
 
 actor SshSession
@@ -64,7 +70,7 @@ actor SshSession
     end
     _kex = SshKexStateMachine(SshRoleClient)
     _auth = SshAuthStateMachine(config.username, config.auth_methods)
-    _bridge = _SshClientTcpBridge(auth, config.host, config.port, this)
+    _bridge = SshClientTcpBridge(auth, config.host, config.port, this)
 
   new create_server(config: SshServerConfig val, notify: SshServerNotify tag) =>
     _role = SshRoleServer
@@ -77,7 +83,10 @@ actor SshSession
     _auth = None
     // Bridge set separately via _set_bridge
 
-  be _set_bridge(bridge: _SshServerTcpBridge tag) =>
+  be _set_bridge(bridge: SshServerTcpBridge tag) =>
+    _bridge = bridge
+
+  be set_server_bridge(bridge: SshServerTcpBridge tag) =>
     _bridge = bridge
 
   // --- Public behaviors (called by consumers) ---
@@ -189,9 +198,9 @@ actor SshSession
   fun ref _send_version() =>
     """Send SSH version string."""
     match _bridge
-    | let b: _SshClientTcpBridge tag =>
+    | let b: SshClientTcpBridge tag =>
       b.write(_version_string + "\r\n")
-    | let b: _SshServerTcpBridge tag =>
+    | let b: SshServerTcpBridge tag =>
       b.write(_version_string + "\r\n")
     end
 
@@ -390,8 +399,8 @@ actor SshSession
     let block_size: USize = _current_block_size()
     let packet = _writer.write(payload, block_size)
     match _bridge
-    | let b: _SshClientTcpBridge tag => b.write(consume packet)
-    | let b: _SshServerTcpBridge tag => b.write(consume packet)
+    | let b: SshClientTcpBridge tag => b.write(consume packet)
+    | let b: SshServerTcpBridge tag => b.write(consume packet)
     end
 
   fun _current_block_size(): USize =>
@@ -403,8 +412,8 @@ actor SshSession
     _send_packet(SshMessages.disconnect(
       SshDisconnectCodes.protocol_error(), err.string()))
     match _bridge
-    | let b: _SshClientTcpBridge tag => b.close()
-    | let b: _SshServerTcpBridge tag => b.close()
+    | let b: SshClientTcpBridge tag => b.close()
+    | let b: SshServerTcpBridge tag => b.close()
     end
     _state = SshStateDisconnected(err)
     _notify_error(err)
