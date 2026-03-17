@@ -1,5 +1,11 @@
 primitive SshMsgTypes
   fun disconnect(): U8 => 1
+  fun ignore(): U8 => 2
+  fun unimplemented(): U8 => 3
+  fun debug(): U8 => 4
+  fun service_request(): U8 => 5
+  fun service_accept(): U8 => 6
+  fun ext_info(): U8 => 7
   fun kexinit(): U8 => 20
   fun newkeys(): U8 => 21
   fun kex_ecdh_init(): U8 => 30
@@ -29,6 +35,12 @@ primitive SshMessages
     w.write_u32(reason_code)
     w.write_string_from_str(description)
     w.write_string_from_str("")  // language tag
+    w.val_bytes()
+
+  fun unimplemented(sequence_number: U32): Array[U8] val =>
+    let w = SshWireWriter
+    w.write_byte(SshMsgTypes.unimplemented())
+    w.write_u32(sequence_number)
     w.val_bytes()
 
   fun kexinit(prefs: SshAlgorithmPreferences val, cookie: Array[U8] val): Array[U8] val =>

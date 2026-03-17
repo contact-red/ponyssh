@@ -313,6 +313,20 @@ actor SshSession
     """Route a decrypted payload to the appropriate handler based on state."""
     try
       let msg_type = payload(0)?
+
+      // Global messages handled in any state (RFC 4253 §11)
+      match msg_type
+      | SshMsgTypes.disconnect() =>
+        _state = SshStateDisconnected(SshConnectionLost)
+        _notify_disconnected()
+        return
+      | SshMsgTypes.ignore() => return    // silently discard
+      | SshMsgTypes.debug() => return     // silently discard
+      | SshMsgTypes.unimplemented() => return  // peer couldn't handle something
+      | SshMsgTypes.ext_info() => return  // extensions info, safe to ignore
+      end
+
+      // State-specific routing
       match _state
       | let _: SshStateHandshake => None
       | let _: SshStateKeyExchange => _handle_kex(msg_type, payload)
