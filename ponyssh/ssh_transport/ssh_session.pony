@@ -138,6 +138,14 @@ actor SshSession
   be reject_host_key() =>
     _disconnect_with_error(SshProtocolVersionMismatch)
 
+  be disconnect() =>
+    """Clean disconnect initiated by consumer."""
+    _send_packet(SshMessages.disconnect(
+      SshDisconnectCodes.by_application(), "disconnect by application"))
+    _close_bridge()
+    _state = SshStateDisconnected(None)
+    _notify_disconnected()
+
   be auth_accept() =>
     match _state
     | let _: SshStateAuth =>
@@ -695,13 +703,17 @@ actor SshSession
     """Send SSH_MSG_DISCONNECT and transition to Disconnected."""
     _send_packet(SshMessages.disconnect(
       SshDisconnectCodes.protocol_error(), err.string()))
-    match _bridge
-    | let b: SshClientTcpBridge tag => b.close()
-    | let b: SshServerTcpBridge tag => b.close()
-    end
+    _close_bridge()
     _state = SshStateDisconnected(err)
     _notify_error(err)
     _notify_disconnected()
+
+  fun ref _close_bridge() =>
+    """Hard-close the TCP bridge to ensure immediate resource cleanup."""
+    match _bridge
+    | let b: SshClientTcpBridge tag => b.dispose()
+    | let b: SshServerTcpBridge tag => b.dispose()
+    end
 
   // --- Notification helpers ---
 

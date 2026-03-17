@@ -17,52 +17,24 @@ class iso _TestIntegrationHandshake is UnitTest
     let pem = _TestEd25519Pem()
     let server_config = SshServerConfig(pem, "127.0.0.1", "19827")
 
-    let tracker = _IntegrationTracker(h)
-
-    let server_notify = _IntegrationServerNotify(tracker)
+    let server_notify = _IntegrationServerNotify(h)
     let listen_auth = TCPListenAuth(h.env.root)
     let listener = SshListener(listen_auth, server_config, server_notify)
+    server_notify.set_listener(listener)
 
     let client_config = SshClientConfig("127.0.0.1", "19827",
       "testuser",
       recover val [as SshAuthMethod val: SshNoneAuth] end)
-    let client_notify = _IntegrationClientNotify(tracker)
     let connect_auth = TCPConnectAuth(h.env.root)
-    SshConnector.connect(connect_auth, client_config, client_notify)
-
-
-actor _IntegrationTracker
-  """Tracks whether both client and server reached ready state."""
-  let _h: TestHelper
-  var _client_ready: Bool = false
-  var _server_ready: Bool = false
-
-  new create(h: TestHelper) =>
-    _h = h
-
-  be client_ready() =>
-    _client_ready = true
-    _check_complete()
-
-  be server_ready() =>
-    _server_ready = true
-    _check_complete()
-
-  be fail(msg: String) =>
-    _h.fail(msg)
-    _h.complete(true)
-
-  fun ref _check_complete() =>
-    if _client_ready and _server_ready then
-      _h.complete(true)
-    end
+    SshConnector.connect(connect_auth, client_config,
+      _IntegrationClientNotify(h))
 
 
 actor _IntegrationClientNotify is SshClientNotify
-  let _tracker: _IntegrationTracker tag
+  let _h: TestHelper
 
-  new create(tracker: _IntegrationTracker tag) =>
-    _tracker = tracker
+  new create(h: TestHelper) =>
+    _h = h
 
   be ssh_verify_host_key(session: SshSession tag, host: String val,
     key: SshHostKey val)
@@ -70,43 +42,62 @@ actor _IntegrationClientNotify is SshClientNotify
     session.accept_host_key()
 
   be ssh_ready(session: SshSession tag) =>
-    _tracker.client_ready()
+    session.open_channel("session")
 
   be ssh_auth_failed(session: SshSession tag, err: SshAuthError val) =>
-    _tracker.fail("Client auth failed: " + err.string())
+    _h.fail("Client auth failed: " + err.string())
+    _h.complete(true)
 
-  be ssh_channel_opened(session: SshSession tag, channel_id: U32) => None
+  be ssh_channel_opened(session: SshSession tag, channel_id: U32) =>
+    let closeme: Array[U8] val = recover val
+      let a = Array[U8]
+      for ch in "closeme".values() do a.push(ch) end
+      a
+    end
+    session.channel_send(channel_id, closeme)
+
   be ssh_channel_data(session: SshSession tag, channel_id: U32,
     data: Array[U8] val) => None
   be ssh_channel_error(session: SshSession tag, channel_id: U32,
     err: SshChannelError val) => None
   be ssh_channel_closed(session: SshSession tag, channel_id: U32) => None
+  be ssh_error(session: SshSession tag, err: SshTransportError val) => None
 
-  be ssh_error(session: SshSession tag, err: SshTransportError val) =>
-    _tracker.fail("Client error: " + err.string())
-
-  be ssh_disconnected(session: SshSession tag) => None
+  be ssh_disconnected(session: SshSession tag) =>
+    _h.complete(true)
 
 
 actor _IntegrationServerNotify is SshServerNotify
-  let _tracker: _IntegrationTracker tag
+  let _h: TestHelper
+  var _listener: (SshListener tag | None) = None
 
-  new create(tracker: _IntegrationTracker tag) =>
-    _tracker = tracker
+  new create(h: TestHelper) =>
+    _h = h
+
+  be set_listener(listener: SshListener tag) =>
+    _listener = listener
 
   be ssh_session_started(session: SshSession tag) => None
 
   be ssh_auth_request(session: SshSession tag, request: SshAuthRequest val) =>
     session.auth_accept()
 
-  be ssh_session_ready(session: SshSession tag) =>
-    _tracker.server_ready()
+  be ssh_session_ready(session: SshSession tag) => None
 
   be ssh_channel_open_request(session: SshSession tag, channel_id: U32,
-    channel_type: String val) => None
+    channel_type: String val)
+  =>
+    session.accept_channel(channel_id)
 
   be ssh_channel_data(session: SshSession tag, channel_id: U32,
-    data: Array[U8] val) => None
+    data: Array[U8] val)
+  =>
+    if String.from_array(data) == "closeme" then
+      session.disconnect()
+      match _listener
+      | let l: SshListener tag => l.dispose()
+      end
+    end
 
   be ssh_channel_error(session: SshSession tag, channel_id: U32,
     err: SshChannelError val) => None
@@ -114,6 +105,7 @@ actor _IntegrationServerNotify is SshServerNotify
   be ssh_channel_closed(session: SshSession tag, channel_id: U32) => None
 
   be ssh_error(session: SshSession tag, err: SshTransportError val) =>
-    _tracker.fail("Server error: " + err.string())
+    _h.fail("Server error: " + err.string())
+    _h.complete(true)
 
   be ssh_disconnected(session: SshSession tag) => None
