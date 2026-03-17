@@ -3,11 +3,17 @@ use "../ssh_crypto"
 
 class SshPacketWriter
   var _sequence_number: U32 = 0
-  var _encrypt_ctx: (SshCipherContext | None) = None
   var _is_aead: Bool = false
-  // Per-packet GCM state: key + 12-byte IV (last 8 bytes incremented per packet)
+  // Per-packet GCM: key + 12-byte IV (last 8 bytes incremented per packet)
   var _gcm_key: (Array[U8] val | None) = None
   var _gcm_iv: (Array[U8] ref | None) = None
+  // Stream cipher (CTR/CBC): persistent context + MAC key
+  var _stream_ctx: (SshCipherContext | None) = None
+  var _mac_key: (Array[U8] val | None) = None
+  var _mac_len: USize = 0
+  var _use_sha512: Bool = false
+  // Legacy single-shot context (for tests)
+  var _encrypt_ctx: (SshCipherContext | None) = None
 
   fun ref set_encrypt_ctx(ctx: SshCipherContext, is_aead: Bool = true) =>
     _encrypt_ctx = ctx
@@ -24,10 +30,25 @@ class SshPacketWriter
     _gcm_iv = iv_copy
     _is_aead = true
 
+  fun ref set_stream_cipher(ctx: SshCipherContext, mac_key: Array[U8] val,
+    mac_len: USize, use_sha512: Bool = false)
+  =>
+    """
+    Set up streaming encryption (CTR/CBC) with HMAC. The cipher context
+    persists across packets. MAC is HMAC-SHA256 or HMAC-SHA512.
+    """
+    _stream_ctx = ctx
+    _mac_key = mac_key
+    _mac_len = mac_len
+    _use_sha512 = use_sha512
+    _is_aead = false
+
   fun ref clear_encrypt_ctx() =>
     _encrypt_ctx = None
     _gcm_key = None
     _gcm_iv = None
+    _stream_ctx = None
+    _mac_key = None
 
   fun ref write(payload: Array[U8] val, block_size: USize = 8): Array[U8] iso^ =>
     """
@@ -131,11 +152,42 @@ class SshPacketWriter
       end
     end
 
+    // Stream cipher (CTR/CBC) with HMAC
+    match (_stream_ctx, _mac_key)
+    | (let ctx: SshCipherContext, let mkey: Array[U8] val) =>
+      let plaintext: Array[U8] val = consume result
+      // HMAC(key, sequence_number_BE || unencrypted_packet)
+      let seq = _sequence_number - 1  // already incremented
+      let mac_input_iso = recover iso Array[U8].create(4 + plaintext.size()) end
+      mac_input_iso.push((seq >> 24).u8())
+      mac_input_iso.push((seq >> 16).u8())
+      mac_input_iso.push((seq >> 8).u8())
+      mac_input_iso.push(seq.u8())
+      for b in plaintext.values() do mac_input_iso.push(b) end
+      let mac_input: Array[U8] val = consume mac_input_iso
+      let mac = if _use_sha512 then
+        SshMac.compute_sha512(mkey, mac_input)
+      else
+        SshMac.compute_sha256(mkey, mac_input)
+      end
+      // Encrypt entire packet (including packet_length)
+      let encrypted = ctx.encrypt_stream(plaintext)
+      return recover iso
+        let out = Array[U8].create(encrypted.size() + _mac_len)
+        for b in encrypted.values() do out.push(b) end
+        var i: USize = 0
+        while i < _mac_len do
+          try out.push(mac(i)?) end
+          i = i + 1
+        end
+        out
+      end
+    end
+
+    // Legacy single-shot context (for encrypted packet tests)
     match _encrypt_ctx
     | let ctx: SshCipherContext =>
       if _is_aead then
-        // AEAD (GCM): packet_length in cleartext, encrypt the rest
-        // packet_length bytes are AAD
         let plaintext: Array[U8] val = consume result
         let pkt_len_bytes: Array[U8] val = recover val
           let b = Array[U8].create(4)
@@ -170,7 +222,6 @@ class SshPacketWriter
           out
         end
       else
-        // Non-AEAD: encrypt entire packet
         let plaintext: Array[U8] val = consume result
         let encrypted = ctx.encrypt(plaintext)
         recover iso
@@ -200,12 +251,21 @@ class SshPacketWriter
 class SshPacketReader
   var _buffer: Array[U8] = Array[U8]
   var _sequence_number: U32 = 0
-  var _decrypt_ctx: (SshCipherContext | None) = None
-  var _mac_digest_len: USize = 0
   var _is_aead: Bool = false
-  // Per-packet GCM state: key + 12-byte IV (last 8 bytes incremented per packet)
+  // Per-packet GCM state
   var _gcm_key: (Array[U8] val | None) = None
   var _gcm_iv: (Array[U8] ref | None) = None
+  var _mac_digest_len: USize = 0
+  // Stream cipher (CTR/CBC)
+  var _stream_ctx: (SshCipherContext | None) = None
+  var _mac_key: (Array[U8] val | None) = None
+  var _use_sha512: Bool = false
+  var _block_size: USize = 16
+  // Decrypted first block (waiting for rest of packet)
+  var _decrypted_first_block: (Array[U8] val | None) = None
+  var _first_block_packet_length: U32 = 0
+  // Legacy single-shot context
+  var _decrypt_ctx: (SshCipherContext | None) = None
 
   fun ref set_decrypt_ctx(
     ctx: SshCipherContext,
@@ -228,11 +288,27 @@ class SshPacketReader
     _mac_digest_len = 16
     _is_aead = true
 
+  fun ref set_stream_cipher(ctx: SshCipherContext, mac_key: Array[U8] val,
+    mac_len: USize, block_size: USize = 16, use_sha512: Bool = false)
+  =>
+    """
+    Set up streaming decryption (CTR/CBC) with HMAC verification.
+    """
+    _stream_ctx = ctx
+    _mac_key = mac_key
+    _mac_digest_len = mac_len
+    _block_size = block_size
+    _use_sha512 = use_sha512
+    _is_aead = false
+
   fun ref clear_decrypt_ctx() =>
     _decrypt_ctx = None
     _mac_digest_len = 0
     _gcm_key = None
     _gcm_iv = None
+    _stream_ctx = None
+    _mac_key = None
+    _decrypted_first_block = None
 
   fun ref append(data: Array[U8] val) =>
     """Append incoming TCP bytes to the internal buffer."""
@@ -265,6 +341,13 @@ class SshPacketReader
       end
     end
 
+    // Stream cipher (CTR/CBC) with HMAC
+    match (_stream_ctx, _mac_key)
+    | (let ctx: SshCipherContext, let mkey: Array[U8] val) =>
+      return _read_stream(ctx, mkey)
+    end
+
+    // Legacy single-shot context (for tests)
     match _decrypt_ctx
     | let ctx: SshCipherContext =>
       if _is_aead then
@@ -366,6 +449,129 @@ class SshPacketReader
     while i < _buffer.size() do
       try new_buffer.push(_buffer(i)?) end
       i = i + 1
+    end
+    _buffer = new_buffer
+
+    _sequence_number = _sequence_number + 1
+    payload
+
+  fun ref _read_stream(ctx: SshCipherContext, mkey: Array[U8] val):
+    (Array[U8] val | SshTransportError | None)
+  =>
+    """
+    Read a stream-cipher encrypted packet (CTR/CBC) with HMAC.
+    Decrypt first block to get packet_length, then decrypt the rest,
+    then verify HMAC.
+    """
+    // Step 1: If we haven't decrypted the first block yet, do it now
+    match _decrypted_first_block
+    | None =>
+      // Need at least one cipher block
+      if _buffer.size() < _block_size then return None end
+      // Extract and decrypt first block
+      let first_block_enc = recover iso Array[U8].create(_block_size) end
+      var i: USize = 0
+      while i < _block_size do
+        try first_block_enc.push(_buffer(i)?) end
+        i = i + 1
+      end
+      let first_block = ctx.decrypt_stream(consume first_block_enc)
+      // Extract packet_length from first 4 bytes
+      let pkt_len = try
+        (first_block(0)?.u32() << 24) or (first_block(1)?.u32() << 16) or
+        (first_block(2)?.u32() << 8) or first_block(3)?.u32()
+      else
+        return SshPacketCorrupt
+      end
+      if pkt_len.usize() > 35000 then return SshPacketTooLarge end
+      _decrypted_first_block = first_block
+      _first_block_packet_length = pkt_len
+    end
+
+    // Step 2: Check if we have enough data for the full packet + MAC
+    let pkt_len = _first_block_packet_length
+    let total_encrypted = 4 + pkt_len.usize()  // packet_length field + body
+    let total_needed = total_encrypted + _mac_digest_len
+    if _buffer.size() < total_needed then return None end
+
+    // Step 3: Decrypt remaining encrypted bytes (after first block)
+    let first_block = match _decrypted_first_block
+    | let fb: Array[U8] val => fb
+    else
+      return SshPacketCorrupt  // shouldn't happen
+    end
+    _decrypted_first_block = None
+
+    let remaining_enc_size = total_encrypted - _block_size
+    let remaining_dec = if remaining_enc_size > 0 then
+      let enc_rest = recover iso Array[U8].create(remaining_enc_size) end
+      var j: USize = _block_size
+      while j < total_encrypted do
+        try enc_rest.push(_buffer(j)?) end
+        j = j + 1
+      end
+      ctx.decrypt_stream(consume enc_rest)
+    else
+      recover val Array[U8] end
+    end
+
+    // Step 4: Assemble full plaintext packet
+    let plaintext_iso = recover iso
+      Array[U8].create(first_block.size() + remaining_dec.size())
+    end
+    for b in first_block.values() do plaintext_iso.push(b) end
+    for b in remaining_dec.values() do plaintext_iso.push(b) end
+    let plaintext: Array[U8] val = consume plaintext_iso
+
+    // Step 5: Extract and verify HMAC
+    let received_mac_iso = recover iso Array[U8].create(_mac_digest_len) end
+    var k: USize = total_encrypted
+    while k < total_needed do
+      try received_mac_iso.push(_buffer(k)?) end
+      k = k + 1
+    end
+    let received_mac: Array[U8] val = consume received_mac_iso
+
+    // Compute expected MAC: HMAC(key, seq_number_BE || plaintext_packet)
+    let mac_input_iso = recover iso Array[U8].create(4 + plaintext.size()) end
+    let seq = _sequence_number
+    mac_input_iso.push((seq >> 24).u8())
+    mac_input_iso.push((seq >> 16).u8())
+    mac_input_iso.push((seq >> 8).u8())
+    mac_input_iso.push(seq.u8())
+    for b in plaintext.values() do mac_input_iso.push(b) end
+    let mac_input: Array[U8] val = consume mac_input_iso
+
+    let expected_mac = if _use_sha512 then
+      SshMac.compute_sha512(mkey, mac_input)
+    else
+      SshMac.compute_sha256(mkey, mac_input)
+    end
+
+    if not SshMac.verify(received_mac, expected_mac) then
+      return SshPacketCorrupt
+    end
+
+    // Step 6: Parse plaintext — packet_length(4) || padding_length(1) || payload || padding
+    let padding_length = try plaintext(4)? else return SshPacketCorrupt end
+    let payload_length = pkt_len.usize() - 1 - padding_length.usize()
+    if padding_length.usize() < 4 then return SshPacketCorrupt end
+
+    let p = recover iso Array[U8].create(payload_length) end
+    var m: USize = 5
+    let end_m = 5 + payload_length
+    while m < end_m do
+      try p.push(plaintext(m)?) end
+      m = m + 1
+    end
+    let payload: Array[U8] val = consume p
+
+    // Consume from buffer
+    let new_buffer = Array[U8].create(_buffer.size() - total_needed)
+    var n: USize = total_needed
+    while n < _buffer.size() do
+      try new_buffer.push(_buffer(n)?) end
+      n = n + 1
     end
     _buffer = new_buffer
 

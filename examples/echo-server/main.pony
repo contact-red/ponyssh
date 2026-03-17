@@ -11,17 +11,18 @@ actor Main
     env.out.print("SSH Echo Server starting on port 2222...")
 
     let pem: Array[U8] val = _EchoServerKey()
-    // Force AES-256-GCM as the only cipher to ensure our per-packet GCM
-    // encryption is used. Other algorithms are not yet fully wired.
-    let gcm_only = recover val
+    let ciphers = recover val
       let a = Array[String val]
       a.push("aes256-gcm@openssh.com")
+      a.push("aes128-gcm@openssh.com")
+      a.push("aes256-ctr")
+      a.push("aes128-cbc")
       a
     end
     let prefs = SshAlgorithmPreferences(
       recover val let a = Array[String val]; a.push("curve25519-sha256"); a end,
       recover val let a = Array[String val]; a.push("ssh-ed25519"); a end,
-      gcm_only, gcm_only,
+      ciphers, ciphers,
       recover val let a = Array[String val]; a.push("hmac-sha2-256"); a end,
       recover val let a = Array[String val]; a.push("hmac-sha2-256"); a end)
     let config = SshServerConfig(pem, "0.0.0.0", "2222", prefs)

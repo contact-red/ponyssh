@@ -614,30 +614,70 @@ actor SshSession
           (keys.enc_key_s2c, keys.iv_s2c, keys.enc_key_c2s, keys.iv_c2s)
         end
 
-        // Use first 12 bytes of derived IV as the full GCM IV.
-        // OpenSSH uses EVP_CTRL_GCM_SET_IV_FIXED with the full 12-byte IV,
-        // then increments the last 8 bytes per packet.
-        let write_iv_12 = recover val
-          let b = Array[U8].create(12)
-          var i: USize = 0
-          while i < 12 do
-            try b.push(write_iv(i)?) end
-            i = i + 1
+        let cipher_name = s.negotiated.cipher_c2s  // same for both directions
+
+        if (cipher_name == "aes256-gcm@openssh.com")
+          or (cipher_name == "aes128-gcm@openssh.com")
+        then
+          // AEAD: per-packet GCM with 12-byte IV, last 8 bytes incremented
+          let write_iv_12 = recover val
+            let b = Array[U8].create(12)
+            var i: USize = 0
+            while i < 12 do try b.push(write_iv(i)?) end; i = i + 1 end
+            b
           end
-          b
-        end
-        let read_iv_12 = recover val
-          let b = Array[U8].create(12)
-          var i: USize = 0
-          while i < 12 do
-            try b.push(read_iv(i)?) end
-            i = i + 1
+          let read_iv_12 = recover val
+            let b = Array[U8].create(12)
+            var i: USize = 0
+            while i < 12 do try b.push(read_iv(i)?) end; i = i + 1 end
+            b
           end
-          b
+          _writer.set_gcm_params(write_key, write_iv_12)
+          _reader.set_gcm_params(read_key, read_iv_12)
+        elseif (cipher_name == "aes256-ctr") or (cipher_name == "aes128-cbc") then
+          // Stream cipher: persistent context + HMAC
+          // IV is first 16 bytes of derived IV (AES block size)
+          let write_iv_16 = recover val
+            let b = Array[U8].create(16)
+            var i: USize = 0
+            while i < 16 do try b.push(write_iv(i)?) end; i = i + 1 end
+            b
+          end
+          let read_iv_16 = recover val
+            let b = Array[U8].create(16)
+            var i: USize = 0
+            while i < 16 do try b.push(read_iv(i)?) end; i = i + 1 end
+            b
+          end
+
+          // MAC keys
+          (let write_mac_key, let read_mac_key) = match _role
+          | SshRoleClient =>
+            (keys.mac_key_c2s, keys.mac_key_s2c)
+          | SshRoleServer =>
+            (keys.mac_key_s2c, keys.mac_key_c2s)
+          end
+
+          let mac_name = s.negotiated.mac_c2s
+          let use_sha512 = mac_name == "hmac-sha2-512"
+          let mac_len: USize = if use_sha512 then 64 else 32 end
+
+          try
+            let w_ctx = if cipher_name == "aes256-ctr" then
+              SshCipherContext.aes_256_ctr(write_key, write_iv_16, true)?
+            else
+              SshCipherContext.aes_128_cbc(write_key, write_iv_16, true)?
+            end
+            let r_ctx = if cipher_name == "aes256-ctr" then
+              SshCipherContext.aes_256_ctr(read_key, read_iv_16, false)?
+            else
+              SshCipherContext.aes_128_cbc(read_key, read_iv_16, false)?
+            end
+            _writer.set_stream_cipher(w_ctx, write_mac_key, mac_len, use_sha512)
+            _reader.set_stream_cipher(r_ctx, read_mac_key, mac_len, 16, use_sha512)
+          end
         end
 
-        _writer.set_gcm_params(write_key, write_iv_12)
-        _reader.set_gcm_params(read_key, read_iv_12)
         _encrypted = true
       end
     end

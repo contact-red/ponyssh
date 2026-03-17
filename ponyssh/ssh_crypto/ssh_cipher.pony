@@ -258,6 +258,38 @@ class ref SshCipherContext
     out.truncate(total)
     consume out
 
+  fun ref encrypt_stream(plaintext: Array[U8] val): Array[U8] val =>
+    """
+    Streaming encrypt (Update only, no Final). For CTR/CBC where the cipher
+    context persists across packets.
+    """
+    let out = recover iso Array[U8].init(0, plaintext.size() + 16) end
+    var out_len: I32 = 0
+    @EVP_EncryptUpdate(
+      _ctx,
+      out.cpointer(),
+      addressof out_len,
+      plaintext.cpointer(),
+      plaintext.size().i32())
+    out.truncate(out_len.usize())
+    consume out
+
+  fun ref decrypt_stream(ciphertext: Array[U8] val): Array[U8] val =>
+    """
+    Streaming decrypt (Update only, no Final). For CTR/CBC where the cipher
+    context persists across packets.
+    """
+    let out = recover iso Array[U8].init(0, ciphertext.size() + 16) end
+    var out_len: I32 = 0
+    @EVP_DecryptUpdate(
+      _ctx,
+      out.cpointer(),
+      addressof out_len,
+      ciphertext.cpointer(),
+      ciphertext.size().i32())
+    out.truncate(out_len.usize())
+    consume out
+
   fun _final() =>
     if not _ctx.is_null() then
       @EVP_CIPHER_CTX_free(_ctx)
