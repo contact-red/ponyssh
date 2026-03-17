@@ -46,19 +46,13 @@ class ref SshWireWriter
 
   fun ref val_bytes(): Array[U8] val =>
     """Collect all chunks into a single contiguous Array[U8] val."""
+    let total = _w.size()
     let chunks: Array[ByteSeq] val = _w.done()
-    var total: USize = 0
-    for chunk in chunks.values() do
-      total = total + match chunk
-      | let a: Array[U8] val => a.size()
-      | let s: String => s.size()
-      end
-    end
     let out = recover iso Array[U8](total) end
     for chunk in chunks.values() do
       match chunk
-      | let a: Array[U8] val => for b in a.values() do out.push(b) end
-      | let s: String => for b in s.values() do out.push(b) end
+      | let a: Array[U8] val => out.append(a)
+      | let s: String => out.append(s.array())
       end
     end
     consume out
