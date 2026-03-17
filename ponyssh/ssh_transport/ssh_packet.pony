@@ -5,13 +5,27 @@ class SshPacketWriter
   var _sequence_number: U32 = 0
   var _encrypt_ctx: (SshCipherContext | None) = None
   var _is_aead: Bool = false
+  // Per-packet GCM state: key + 4-byte fixed IV prefix
+  var _gcm_key: (Array[U8] val | None) = None
+  var _gcm_iv_fixed: (Array[U8] val | None) = None
+  var _gcm_counter: U64 = 0
 
   fun ref set_encrypt_ctx(ctx: SshCipherContext, is_aead: Bool = true) =>
     _encrypt_ctx = ctx
     _is_aead = is_aead
 
+  fun ref set_gcm_params(key: Array[U8] val, iv_fixed: Array[U8] val) =>
+    """Set up per-packet GCM encryption. A fresh cipher context is created per packet."""
+    _gcm_key = key
+    _gcm_iv_fixed = iv_fixed
+    _gcm_counter = 0
+    // Set a dummy encrypt_ctx so the write path knows we're encrypting
+    _is_aead = true
+
   fun ref clear_encrypt_ctx() =>
     _encrypt_ctx = None
+    _gcm_key = None
+    _gcm_iv_fixed = None
 
   fun ref write(payload: Array[U8] val, block_size: USize = 8): Array[U8] iso^ =>
     """
@@ -53,6 +67,66 @@ class SshPacketWriter
     end
 
     _sequence_number = _sequence_number + 1
+
+    // Per-packet GCM: create a fresh cipher context for each packet
+    match (_gcm_key, _gcm_iv_fixed)
+    | (let key: Array[U8] val, let iv_fixed: Array[U8] val) =>
+      let plaintext: Array[U8] val = consume result
+      let iv = recover val
+        let b = Array[U8].create(12)
+        try
+          b.push(iv_fixed(0)?); b.push(iv_fixed(1)?)
+          b.push(iv_fixed(2)?); b.push(iv_fixed(3)?)
+        end
+        let ctr = _gcm_counter
+        b.push((ctr >> 56).u8()); b.push((ctr >> 48).u8())
+        b.push((ctr >> 40).u8()); b.push((ctr >> 32).u8())
+        b.push((ctr >> 24).u8()); b.push((ctr >> 16).u8())
+        b.push((ctr >> 8).u8()); b.push(ctr.u8())
+        b
+      end
+      _gcm_counter = _gcm_counter + 1
+      let pkt_len_bytes: Array[U8] val = recover val
+        let b = Array[U8].create(4)
+        try
+          b.push(plaintext(0)?); b.push(plaintext(1)?)
+          b.push(plaintext(2)?); b.push(plaintext(3)?)
+        end
+        b
+      end
+      let body: Array[U8] val = recover val
+        let b = Array[U8].create(plaintext.size() - 4)
+        var j: USize = 4
+        while j < plaintext.size() do
+          try b.push(plaintext(j)?) end
+          j = j + 1
+        end
+        b
+      end
+      try
+        let ctx = SshCipherContext.aes_256_gcm(key, iv, true)?
+        try ctx.set_aad(pkt_len_bytes)? end
+        let encrypted = ctx.encrypt(body, true)
+        let gcm_tag = match ctx.tag_value()
+        | let t: Array[U8] val => t
+        | None => recover val Array[U8] end
+        end
+        return recover iso
+          let out = Array[U8].create(4 + encrypted.size() + gcm_tag.size())
+          for b1 in pkt_len_bytes.values() do out.push(b1) end
+          for b2 in encrypted.values() do out.push(b2) end
+          for b3 in gcm_tag.values() do out.push(b3) end
+          out
+        end
+      else
+        // Cipher creation failed, return plaintext (should not happen)
+        return recover iso
+          let out = Array[U8].create(plaintext.size())
+          for b in plaintext.values() do out.push(b) end
+          out
+        end
+      end
+    end
 
     match _encrypt_ctx
     | let ctx: SshCipherContext =>
@@ -114,6 +188,10 @@ class SshPacketReader
   var _decrypt_ctx: (SshCipherContext | None) = None
   var _mac_digest_len: USize = 0
   var _is_aead: Bool = false
+  // Per-packet GCM state
+  var _gcm_key: (Array[U8] val | None) = None
+  var _gcm_iv_fixed: (Array[U8] val | None) = None
+  var _gcm_counter: U64 = 0
 
   fun ref set_decrypt_ctx(
     ctx: SshCipherContext,
@@ -124,9 +202,19 @@ class SshPacketReader
     _mac_digest_len = mac_digest_len
     _is_aead = is_aead
 
+  fun ref set_gcm_params(key: Array[U8] val, iv_fixed: Array[U8] val) =>
+    """Set up per-packet GCM decryption. A fresh cipher context is created per packet."""
+    _gcm_key = key
+    _gcm_iv_fixed = iv_fixed
+    _gcm_counter = 0
+    _mac_digest_len = 16
+    _is_aead = true
+
   fun ref clear_decrypt_ctx() =>
     _decrypt_ctx = None
     _mac_digest_len = 0
+    _gcm_key = None
+    _gcm_iv_fixed = None
 
   fun ref append(data: Array[U8] val) =>
     """Append incoming TCP bytes to the internal buffer."""
@@ -140,6 +228,34 @@ class SshPacketReader
     - SshTransportError on protocol error
     - None if not enough data yet
     """
+    // Per-packet GCM: create a fresh cipher context for each packet
+    match (_gcm_key, _gcm_iv_fixed)
+    | (let key: Array[U8] val, let iv_fixed: Array[U8] val) =>
+      let iv = recover val
+        let b = Array[U8].create(12)
+        try
+          b.push(iv_fixed(0)?); b.push(iv_fixed(1)?)
+          b.push(iv_fixed(2)?); b.push(iv_fixed(3)?)
+        end
+        let ctr = _gcm_counter
+        b.push((ctr >> 56).u8()); b.push((ctr >> 48).u8())
+        b.push((ctr >> 40).u8()); b.push((ctr >> 32).u8())
+        b.push((ctr >> 24).u8()); b.push((ctr >> 16).u8())
+        b.push((ctr >> 8).u8()); b.push(ctr.u8())
+        b
+      end
+      try
+        let ctx = SshCipherContext.aes_256_gcm(key, iv, false)?
+        let result = _read_aead(ctx)
+        match result
+        | let _: Array[U8] val => _gcm_counter = _gcm_counter + 1
+        end
+        return result
+      else
+        return SshPacketCorrupt
+      end
+    end
+
     match _decrypt_ctx
     | let ctx: SshCipherContext =>
       if _is_aead then

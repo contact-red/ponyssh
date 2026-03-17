@@ -56,6 +56,7 @@ actor SshSession
   var _auth: (SshAuthStateMachine | None) = None
   var _host_key: (SshHostKeyPair | None) = None
   var _our_kexinit: (Array[U8] val | None) = None
+  var _encrypted: Bool = false
 
   let _version_string: String val = "SSH-2.0-ponyssh_0.1"
 
@@ -185,6 +186,24 @@ actor SshSession
         _send_packet(SshChannelMessages.channel_open_failure(
           ch.remote_id, reason, "rejected"))
         _channel_manager.close_channel(channel_id)
+      end
+    end
+
+  be accept_request(channel_id: U32) =>
+    match _state
+    | let _: SshStateConnected =>
+      match _channel_manager.get(channel_id)
+      | let ch: SshChannelState =>
+        _send_packet(SshChannelMessages.channel_success(ch.remote_id))
+      end
+    end
+
+  be reject_request(channel_id: U32) =>
+    match _state
+    | let _: SshStateConnected =>
+      match _channel_manager.get(channel_id)
+      | let ch: SshChannelState =>
+        _send_packet(SshChannelMessages.channel_failure(ch.remote_id))
       end
     end
 
@@ -379,6 +398,11 @@ actor SshSession
       else
         recover val Array[U8] end
       end
+      // Activate encryption using stored key exchange results
+      match _state
+      | let kex_s: SshStateKeyExchange =>
+        _activate_encryption(kex_s, session_id)
+      end
       _state = SshStateAuth(session_id)
       match _role
       | SshRoleClient =>
@@ -391,7 +415,8 @@ actor SshSession
   =>
     """
     Server handles SSH_MSG_KEX_ECDH_INIT: generate keypair, compute shared
-    secret, compute exchange hash, sign it, send reply + NEWKEYS.
+    secret, compute exchange hash per RFC 4253 section 8, sign it,
+    send reply + NEWKEYS.
     """
     try
       let server_kex = SshKexCurve25519.create()?
@@ -399,26 +424,10 @@ actor SshSession
 
       match server_kex.derive_shared_secret(client_pub)
       | let shared_secret: Array[U8] val =>
-        // Compute simplified exchange hash: SHA-256(client_pub || server_pub || shared_secret)
-        let hash_input = recover val
-          let buf = Array[U8]
-          for b in client_pub.values() do buf.push(b) end
-          for b in server_pub.values() do buf.push(b) end
-          for b in shared_secret.values() do buf.push(b) end
-          buf
-        end
-        let exchange_hash = SshHash.sha256(hash_input)
-
-        // Set session_id (first exchange hash per RFC 4253)
-        if _context.session_id is None then
-          _context.session_id = exchange_hash
-        end
-
-        // Build host key blob and sign the exchange hash
+        // Build host key blob first (needed for exchange hash)
         match _host_key
         | let hk: SshHostKeyPair =>
           let pub_key = hk.public_key()
-          // Host key blob: string("ssh-ed25519") || string(public_key_data)
           let host_key_blob = recover val
             let w = SshWireWriter
             w.write_string_from_str(pub_key.algorithm)
@@ -426,9 +435,30 @@ actor SshSession
             w.val_bytes()
           end
 
+          // Compute full exchange hash per RFC 4253 section 8 / RFC 8731:
+          // H = SHA256(string(V_C) || string(V_S) || string(I_C) || string(I_S)
+          //           || string(K_S) || string(Q_C) || string(Q_S) || mpint(K))
+          let client_version = match _context.remote_version
+          | let v: String val => v
+          else ""
+          end
+          let server_version: String val = _version_string
+          let exchange_hash = _compute_exchange_hash(
+            client_version, server_version,
+            s.their_kexinit, s.our_kexinit,
+            host_key_blob, client_pub, server_pub, shared_secret)
+
+          // Set session_id (first exchange hash per RFC 4253)
+          if _context.session_id is None then
+            _context.session_id = exchange_hash
+          end
+
+          // Store shared secret and exchange hash for key derivation after NEWKEYS
+          s.shared_secret = shared_secret
+          s.exchange_hash = exchange_hash
+
           match hk.sign(exchange_hash)
           | let raw_sig: Array[U8] val =>
-            // Signature blob: string("ssh-ed25519") || string(raw_signature)
             let sig_blob = recover val
               let w = SshWireWriter
               w.write_string_from_str(pub_key.algorithm)
@@ -458,27 +488,33 @@ actor SshSession
   =>
     """
     Client handles SSH_MSG_KEX_ECDH_REPLY: compute shared secret,
-    compute exchange hash, verify signature, request host key verification.
+    compute exchange hash per RFC 4253 section 8, verify signature,
+    request host key verification.
     """
     match s.our_kex
     | let client_kex: SshKexCurve25519 =>
       let client_pub = client_kex.public_key()
       match client_kex.derive_shared_secret(server_pub)
       | let shared_secret: Array[U8] val =>
-        // Same simplified exchange hash as server
-        let hash_input = recover val
-          let buf = Array[U8]
-          for b in client_pub.values() do buf.push(b) end
-          for b in server_pub.values() do buf.push(b) end
-          for b in shared_secret.values() do buf.push(b) end
-          buf
+        // Compute full exchange hash per RFC 4253 section 8 / RFC 8731
+        let client_version: String val = _version_string
+        let server_version = match _context.remote_version
+        | let v: String val => v
+        else ""
         end
-        let exchange_hash = SshHash.sha256(hash_input)
+        let exchange_hash = _compute_exchange_hash(
+          client_version, server_version,
+          s.our_kexinit, s.their_kexinit,
+          host_key_blob, client_pub, server_pub, shared_secret)
 
         // Set session_id
         if _context.session_id is None then
           _context.session_id = exchange_hash
         end
+
+        // Store shared secret and exchange hash for key derivation after NEWKEYS
+        s.shared_secret = shared_secret
+        s.exchange_hash = exchange_hash
 
         // Parse host key blob to get SshHostKey
         try
@@ -489,7 +525,6 @@ actor SshSession
           _context.server_host_key = host_key
 
           // Verify the signature on the exchange hash
-          // Parse signature blob: string(algo) || string(raw_sig)
           let sr = SshWireReader(signature)
           let sig_algo = sr.read_string_as_str()?
           let raw_sig = sr.read_string()?
@@ -516,6 +551,73 @@ actor SshSession
       end
     else
       _disconnect_with_error(SshKexFailed(SshKeyInvalid))
+    end
+
+  fun _compute_exchange_hash(
+    client_version: String val, server_version: String val,
+    client_kexinit: Array[U8] val, server_kexinit: Array[U8] val,
+    host_key_blob: Array[U8] val,
+    client_pub: Array[U8] val, server_pub: Array[U8] val,
+    shared_secret: Array[U8] val): Array[U8] val
+  =>
+    """
+    Compute the full exchange hash per RFC 4253 section 8 / RFC 8731:
+    H = SHA256(string(V_C) || string(V_S) || string(I_C) || string(I_S)
+              || string(K_S) || string(Q_C) || string(Q_S) || mpint(K))
+    """
+    let hash_input = recover val
+      let w = SshWireWriter
+      w.write_string_from_str(client_version)
+      w.write_string_from_str(server_version)
+      w.write_string(client_kexinit)
+      w.write_string(server_kexinit)
+      w.write_string(host_key_blob)
+      w.write_string(client_pub)
+      w.write_string(server_pub)
+      w.write_mpint(shared_secret)
+      w.val_bytes()
+    end
+    SshHash.sha256(hash_input)
+
+  fun ref _activate_encryption(s: SshStateKeyExchange, session_id: Array[U8] val) =>
+    """
+    Derive keys from the completed key exchange and activate per-packet
+    AES-256-GCM encryption on the reader and writer.
+    """
+    match (s.shared_secret, s.exchange_hash)
+    | (let shared: Array[U8] val, let hash: Array[U8] val) =>
+      match _kex
+      | let kex: SshKexStateMachine =>
+        let keys = kex.derive_keys(shared, hash, session_id, s.negotiated)
+
+        // Determine which key/IV pair to use based on role.
+        // c2s = client-to-server, s2c = server-to-client.
+        // Reader decrypts incoming, writer encrypts outgoing.
+        (let write_key, let write_iv, let read_key, let read_iv) = match _role
+        | SshRoleClient =>
+          (keys.enc_key_c2s, keys.iv_c2s, keys.enc_key_s2c, keys.iv_s2c)
+        | SshRoleServer =>
+          (keys.enc_key_s2c, keys.iv_s2c, keys.enc_key_c2s, keys.iv_c2s)
+        end
+
+        // Truncate IV to 4 bytes (the fixed field for AES-256-GCM per RFC 5647)
+        let write_iv_fixed = recover val
+          let b = Array[U8].create(4)
+          try b.push(write_iv(0)?); b.push(write_iv(1)?)
+                b.push(write_iv(2)?); b.push(write_iv(3)?) end
+          b
+        end
+        let read_iv_fixed = recover val
+          let b = Array[U8].create(4)
+          try b.push(read_iv(0)?); b.push(read_iv(1)?)
+                b.push(read_iv(2)?); b.push(read_iv(3)?) end
+          b
+        end
+
+        _writer.set_gcm_params(write_key, write_iv_fixed)
+        _reader.set_gcm_params(read_key, read_iv_fixed)
+        _encrypted = true
+      end
     end
 
   fun ref _handle_auth(msg_type: U8, payload: Array[U8] val) =>
@@ -677,6 +779,20 @@ actor SshSession
         _channel_manager.close_channel(recipient_channel)
         _notify_channel_closed(recipient_channel)
       end
+    | SshChannelMsgTypes.channel_request() =>
+      try
+        let r = SshWireReader(payload)
+        r.read_byte()?  // msg type
+        let recipient_channel = r.read_u32()?
+        let request_type = r.read_string_as_str()?
+        let want_reply = r.read_bool()?
+        match _server_notify
+        | let n: SshServerNotify tag =>
+          n.ssh_channel_request(this, recipient_channel, request_type, want_reply)
+        end
+      end
+    | SshChannelMsgTypes.channel_success() => None
+    | SshChannelMsgTypes.channel_failure() => None
     | SshMsgTypes.kexinit() =>
       // Rekeying
       state.rekeying = true
@@ -697,7 +813,7 @@ actor SshSession
 
   fun _current_block_size(): USize =>
     """Return cipher block size, or 8 for plaintext."""
-    8  // TODO: return actual cipher block size when encrypted
+    if _encrypted then 16 else 8 end
 
   fun ref _disconnect_with_error(err: SshTransportError) =>
     """Send SSH_MSG_DISCONNECT and transition to Disconnected."""

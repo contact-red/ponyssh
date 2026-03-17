@@ -1,0 +1,5 @@
+_corral/
+_repos/
+build/
+lock.json
+/ssh_test

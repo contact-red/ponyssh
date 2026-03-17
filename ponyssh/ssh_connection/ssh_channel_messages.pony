@@ -8,6 +8,9 @@ primitive SshChannelMsgTypes
   fun channel_data(): U8 => 94
   fun channel_eof(): U8 => 96
   fun channel_close(): U8 => 97
+  fun channel_request(): U8 => 98
+  fun channel_success(): U8 => 99
+  fun channel_failure(): U8 => 100
 
 primitive SshChannelMessages
   fun channel_open(channel_type: String val, sender_channel: U32,
@@ -66,5 +69,17 @@ primitive SshChannelMessages
   fun channel_close(recipient_channel: U32): Array[U8] val =>
     let w = SshWireWriter
     w.write_byte(SshChannelMsgTypes.channel_close())
+    w.write_u32(recipient_channel)
+    w.val_bytes()
+
+  fun channel_success(recipient_channel: U32): Array[U8] val =>
+    let w = SshWireWriter
+    w.write_byte(SshChannelMsgTypes.channel_success())
+    w.write_u32(recipient_channel)
+    w.val_bytes()
+
+  fun channel_failure(recipient_channel: U32): Array[U8] val =>
+    let w = SshWireWriter
+    w.write_byte(SshChannelMsgTypes.channel_failure())
     w.write_u32(recipient_channel)
     w.val_bytes()

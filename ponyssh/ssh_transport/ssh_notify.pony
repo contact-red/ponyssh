@@ -19,6 +19,8 @@ interface SshServerNotify
   be ssh_auth_request(session: SshSession tag, request: SshAuthRequest val)
   be ssh_session_ready(session: SshSession tag)
   be ssh_channel_open_request(session: SshSession tag, channel_id: U32, channel_type: String val)
+  be ssh_channel_request(session: SshSession tag, channel_id: U32,
+    request_type: String val, want_reply: Bool)
   be ssh_channel_data(session: SshSession tag, channel_id: U32, data: Array[U8] val)
   be ssh_channel_error(session: SshSession tag, channel_id: U32, err: SshChannelError val)
   be ssh_channel_closed(session: SshSession tag, channel_id: U32)
