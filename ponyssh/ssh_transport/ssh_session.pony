@@ -632,8 +632,23 @@ actor SshSession
             while i < 12 do try b.push(read_iv(i)?) end; i = i + 1 end
             b
           end
-          _writer.set_gcm_params(write_key, write_iv_12)
-          _reader.set_gcm_params(read_key, read_iv_12)
+          // Truncate key to cipher's key length (16 for aes128, 32 for aes256)
+          let key_len: USize = if cipher_name == "aes128-gcm@openssh.com"
+            then 16 else 32 end
+          let wk = recover val
+            let b = Array[U8].create(key_len)
+            var i: USize = 0
+            while i < key_len do try b.push(write_key(i)?) end; i = i + 1 end
+            b
+          end
+          let rk = recover val
+            let b = Array[U8].create(key_len)
+            var i: USize = 0
+            while i < key_len do try b.push(read_key(i)?) end; i = i + 1 end
+            b
+          end
+          _writer.set_gcm_params(wk, write_iv_12)
+          _reader.set_gcm_params(rk, read_iv_12)
         elseif (cipher_name == "aes256-ctr") or (cipher_name == "aes128-cbc") then
           // Stream cipher: persistent context + HMAC
           // IV is first 16 bytes of derived IV (AES block size)

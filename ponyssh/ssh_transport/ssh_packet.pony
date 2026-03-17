@@ -128,7 +128,11 @@ class SshPacketWriter
         b
       end
       try
-        let ctx = SshCipherContext.aes_256_gcm(key, iv, true)?
+        let ctx = if key.size() <= 16 then
+          SshCipherContext.aes_128_gcm(key, iv, true)?
+        else
+          SshCipherContext.aes_256_gcm(key, iv, true)?
+        end
         try ctx.set_aad(pkt_len_bytes)? end
         let encrypted = ctx.encrypt(body, true)
         let gcm_tag = match ctx.tag_value()
@@ -330,7 +334,11 @@ class SshPacketReader
       for b in gcm_iv.values() do iv_iso.push(b) end
       let iv: Array[U8] val = consume iv_iso
       try
-        let ctx = SshCipherContext.aes_256_gcm(key, iv, false)?
+        let ctx = if key.size() <= 16 then
+          SshCipherContext.aes_128_gcm(key, iv, false)?
+        else
+          SshCipherContext.aes_256_gcm(key, iv, false)?
+        end
         let result = _read_aead(ctx)
         match result
         | let _: Array[U8] val => _increment_iv(gcm_iv)
