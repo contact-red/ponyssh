@@ -1,0 +1,70 @@
+use "../ssh_transport"
+
+primitive SshChannelMsgTypes
+  fun channel_open(): U8 => 90
+  fun channel_open_confirmation(): U8 => 91
+  fun channel_open_failure(): U8 => 92
+  fun channel_window_adjust(): U8 => 93
+  fun channel_data(): U8 => 94
+  fun channel_eof(): U8 => 96
+  fun channel_close(): U8 => 97
+
+primitive SshChannelMessages
+  fun channel_open(channel_type: String val, sender_channel: U32,
+    initial_window: U32, max_packet_size: U32): Array[U8] val
+  =>
+    let w = SshWireWriter
+    w.write_byte(SshChannelMsgTypes.channel_open())
+    w.write_string_from_str(channel_type)
+    w.write_u32(sender_channel)
+    w.write_u32(initial_window)
+    w.write_u32(max_packet_size)
+    w.val_bytes()
+
+  fun channel_open_confirmation(recipient_channel: U32, sender_channel: U32,
+    initial_window: U32, max_packet_size: U32): Array[U8] val
+  =>
+    let w = SshWireWriter
+    w.write_byte(SshChannelMsgTypes.channel_open_confirmation())
+    w.write_u32(recipient_channel)
+    w.write_u32(sender_channel)
+    w.write_u32(initial_window)
+    w.write_u32(max_packet_size)
+    w.val_bytes()
+
+  fun channel_open_failure(recipient_channel: U32, reason_code: U32,
+    description: String val): Array[U8] val
+  =>
+    let w = SshWireWriter
+    w.write_byte(SshChannelMsgTypes.channel_open_failure())
+    w.write_u32(recipient_channel)
+    w.write_u32(reason_code)
+    w.write_string_from_str(description)
+    w.write_string_from_str("")  // language tag
+    w.val_bytes()
+
+  fun channel_window_adjust(recipient_channel: U32, bytes_to_add: U32): Array[U8] val =>
+    let w = SshWireWriter
+    w.write_byte(SshChannelMsgTypes.channel_window_adjust())
+    w.write_u32(recipient_channel)
+    w.write_u32(bytes_to_add)
+    w.val_bytes()
+
+  fun channel_data(recipient_channel: U32, data: Array[U8] val): Array[U8] val =>
+    let w = SshWireWriter
+    w.write_byte(SshChannelMsgTypes.channel_data())
+    w.write_u32(recipient_channel)
+    w.write_string(data)
+    w.val_bytes()
+
+  fun channel_eof(recipient_channel: U32): Array[U8] val =>
+    let w = SshWireWriter
+    w.write_byte(SshChannelMsgTypes.channel_eof())
+    w.write_u32(recipient_channel)
+    w.val_bytes()
+
+  fun channel_close(recipient_channel: U32): Array[U8] val =>
+    let w = SshWireWriter
+    w.write_byte(SshChannelMsgTypes.channel_close())
+    w.write_u32(recipient_channel)
+    w.val_bytes()

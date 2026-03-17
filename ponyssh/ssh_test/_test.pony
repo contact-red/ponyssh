@@ -4,6 +4,7 @@ use "../ssh_error"
 use "../ssh_crypto"
 use "../ssh_transport"
 use "../ssh_auth"
+use "../ssh_connection"
 
 actor Main is TestList
   new create(env: Env) =>
@@ -41,6 +42,10 @@ actor Main is TestList
     test(_TestAuthMessageEncode)
     test(_TestAuthStateMachineTriesMethods)
     test(_TestAuthFailureDecode)
+    test(_TestChannelOpenAndConfirm)
+    test(_TestChannelDataSendWindowTracking)
+    test(_TestChannelClose)
+    test(_TestChannelFindByRemoteId)
 
 class iso _TestErrorStrings is UnitTest
   fun name(): String => "ssh_error/error_strings"
