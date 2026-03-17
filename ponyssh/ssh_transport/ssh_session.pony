@@ -193,6 +193,21 @@ actor SshSession
     _notify_error(SshConnectionLost)
     _notify_disconnected()
 
+  // --- Crypto worker result behaviors ---
+
+  be _kex_computed(our_public: Array[U8] val, shared_secret: Array[U8] val) =>
+    """Crypto worker completed key exchange computation."""
+    match _state
+    | let s: SshStateKeyExchange =>
+      s.shared_secret = shared_secret
+      // TODO: compute exchange hash, verify host key, send NEWKEYS
+      // For now, just store the result
+    end
+
+  be _kex_failed(err: SshKexFailed) =>
+    """Crypto worker failed key exchange."""
+    _disconnect_with_error(err)
+
   // --- Private methods ---
 
   fun ref _send_version() =>
