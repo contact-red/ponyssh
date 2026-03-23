@@ -6,7 +6,7 @@ SSH clients send `\r` when the user presses Enter. Pony's `buffered.Reader.line(
 
 ## Design Decisions
 
-- **PTY state embedded in channel state** — `SshChannelState` gets an optional `pty` field, set when a pty-req is accepted. Non-PTY channels remain raw.
+- **PTY state embedded in channel state** — `SshChannelState` gets an optional `pty` field, stored optimistically on parse and cleared on reject. Non-PTY channels remain raw.
 - **Transparent transformation** — `ssh_channel_data` delivers transformed data. Applications wanting raw bytes use non-PTY channels.
 - **Separate notify callbacks** — dedicated `ssh_pty_request`, `ssh_shell_request`, `ssh_window_change` callbacks instead of a union type. Unrecognised request types still route to the existing `ssh_channel_request` catch-all.
 - **Transform in session dispatch** — terminal mode transformations applied in `_handle_connected()` channel_data path, before calling `_notify_channel_data`.
@@ -19,7 +19,7 @@ SSH clients send `\r` when the user presses Enter. Pony's `buffered.Reader.line(
 New class in `ssh_connection/ssh_pty.pony`:
 
 ```pony
-class SshPtyState
+class val SshPtyState
   let term: String val
   let width_chars: U32
   let height_rows: U32
@@ -28,17 +28,19 @@ class SshPtyState
   let modes: Array[(U8, U32)] val
 ```
 
+- `SshPtyState` is immutable (`val` refcap). All fields are `let`.
 - `modes` stores every `(opcode, value)` pair from the RFC 4254 §8 encoded terminal modes string.
 - `term` is the TERM environment variable value (e.g. "xterm-256color").
-- Dimension fields are updated in place on window-change.
+- On window-change, the channel's `pty` field is replaced with a new `SshPtyState` containing updated dimensions and the same `term`/`modes`. Resizes are infrequent so the allocation is negligible.
 
 ### SshChannelState changes
 
 ```pony
-var pty: (SshPtyState | None) = None
+var pty: (SshPtyState val | None) = None
 ```
 
-Set when a pty-req is accepted. Stays `None` for non-PTY channels.
+- `pty` is set immediately when a pty-req is parsed (optimistic). If the server calls `reject_request`, the session clears it back to `None`. This avoids sequencing issues: since `SshSession` is a single actor but notify callbacks are asynchronous (`be`), subsequent channel requests (e.g. shell) may be parsed before the application's `accept_request`/`reject_request` arrives. Storing optimistically means no pending state can be lost or overwritten.
+- `pty` is `None` for non-PTY channels. Reassigned (not mutated) on window-change.
 
 ## Message Parsing
 
@@ -70,7 +72,7 @@ uint32    terminal width, pixels
 uint32    terminal height, pixels
 ```
 
-Updates dimension fields on the channel's existing `SshPtyState`. No accept/reject needed.
+Replaces the channel's `SshPtyState` with a new instance containing updated dimensions and the same `term`/`modes`. No accept/reject needed.
 
 ### shell
 
@@ -92,8 +94,7 @@ be ssh_window_change(session: SshSession tag, channel_id: U32,
 ```
 
 - Server accepts/rejects pty-req and shell via existing `session.accept_request(channel_id)` / `session.reject_request(channel_id)`.
-- When pty-req is accepted, session stores `SshPtyState` on the channel.
-- When rejected, no PTY state is set — channel remains raw.
+- PTY state is stored optimistically on the channel when the pty-req is parsed. `accept_request` sends `channel_success` (PTY state already in place). `reject_request` sends `channel_failure` and clears the PTY state from the channel. This avoids sequencing issues between asynchronous notify callbacks and subsequent channel requests.
 - `ssh_channel_request` remains as catch-all for unrecognised request types.
 
 ## Terminal Mode Transformation
