@@ -1,4 +1,6 @@
+use "encode/base64"
 use "lori"
+use "buffered"
 use "../../ponyssh/ssh_transport"
 use "../../ponyssh/ssh_crypto"
 use "../../ponyssh/ssh_error"
@@ -38,9 +40,24 @@ primitive _EchoServerKey
       "-----END PRIVATE KEY-----\n"
     end).array()
 
+primitive _AuthorizedKey
+  fun apply(): Array[U8] val =>
+    """
+    Authorized public key blob (base64-decoded from ~/.ssh/id_ed25519.pub).
+    Replace this with your own key.
+    """
+    try
+      Base64.decode[Array[U8] iso](
+        "AAAAC3NzaC1lZDI1NTE5AAAAIFt4LNU1hzaNa3ap5OIrKey19KHD8clnopA5BgODuVtx")?
+    else
+      recover val Array[U8] end
+    end
+
 actor EchoServerNotify is SshServerNotify
   let _env: Env
+  let _authorized_key: Array[U8] val = _AuthorizedKey()
   var _last_username: String val = ""
+  var _reader: Reader = Reader
 
   new create(env: Env) => _env = env
 
@@ -58,15 +75,41 @@ actor EchoServerNotify is SshServerNotify
         _env.out.print("  wrong password")
         let remaining = recover val
           let a = Array[String val]
+          a.push("publickey")
           a.push("password")
           a
         end
         session.auth_reject(remaining)
       end
+    | let pk: SshAuthPublicKeyData val =>
+      // Check if offered key matches our authorized key (constant-time)
+      if not SshMac.verify(pk.public_key, _authorized_key) then
+        _env.out.print("  publickey rejected — unknown key")
+        let remaining = recover val
+          let a = Array[String val]
+          a.push("publickey")
+          a.push("password")
+          a
+        end
+        session.auth_reject(remaining)
+        return
+      end
+      match pk.signature
+      | None =>
+        // Query: client asks if this key is acceptable.
+        _env.out.print("  publickey query for " + pk.algorithm + " — key recognized")
+        session.auth_pk_ok(pk.algorithm, pk.public_key)
+      | let _: Array[U8] val =>
+        // Actual auth with signature from a recognized key.
+        _env.out.print("  publickey auth with " + pk.algorithm + " — accepted")
+        _last_username = request.username
+        session.auth_accept()
+      end
     else
-      // Reject non-password methods, tell client to use password
+      // Reject other methods, offer publickey and password
       let remaining = recover val
         let a = Array[String val]
+        a.push("publickey")
         a.push("password")
         a
       end
@@ -102,6 +145,22 @@ actor EchoServerNotify is SshServerNotify
     data: Array[U8] val)
   =>
     let input = String.from_array(data)
+    _reader.append(input)
+    var line: String val = ""
+    for chr in data.values() do
+      _env.out.print("chr: " + chr.string())
+    end
+    _env.out.print("R: " + input)
+    try
+      while (true) do
+        line = _reader.line()?
+        _env.out.print("line: " + line)
+        session.channel_send(channel_id, line.array())
+      end
+    else
+      _env.out.print("Size: " + _reader.size().string())
+    end
+
     if input.contains("/quit") then
       let bye: Array[U8] val = recover val
         let msg = "Goodbye!\r\n"

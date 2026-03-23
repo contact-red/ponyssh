@@ -162,6 +162,12 @@ actor SshSession
       end
     end
 
+  be auth_pk_ok(algorithm: String val, public_key: Array[U8] val) =>
+    match _state
+    | let _: SshStateAuth =>
+      _send_packet(SshAuthMessages.userauth_pk_ok(algorithm, public_key))
+    end
+
   be auth_reject(remaining: Array[String val] val) =>
     match _state
     | let _: SshStateAuth =>
@@ -750,6 +756,28 @@ actor SshSession
           let request = SshAuthRequest(username, method, method_data)
           match _server_notify
           | let n: SshServerNotify tag => n.ssh_auth_request(this, request)
+          end
+        end
+      end
+    | SshAuthMsgTypes.userauth_pk_ok() =>
+      // Server accepted our public key query. Send actual auth with signature.
+      match _role
+      | SshRoleClient =>
+        match _auth
+        | let auth_sm: SshAuthStateMachine =>
+          let session_id = match _context.session_id
+          | let id: Array[U8] val => id
+          else recover val Array[U8] end
+          end
+          match auth_sm.handle_pk_ok(session_id)
+          | let req: Array[U8] val =>
+            _send_packet(req)
+          | SshAuthRejected =>
+            match _client_notify
+            | let n: SshClientNotify tag =>
+              n.ssh_auth_failed(this, SshAuthRejected)
+            end
+            _disconnect_with_error(SshConnectionLost)
           end
         end
       end

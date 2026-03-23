@@ -1,3 +1,4 @@
+use "encode/base64"
 use "pony_test"
 use "pony_check"
 use "../ssh_error"
@@ -55,6 +56,7 @@ actor Main is TestList
     test(_TestChacha20Poly1305SequenceNumberMatters)
     test(_TestChacha20Poly1305Corrupted)
     test(_TestIntegrationHandshake)
+    test(_TestIntegrationPubkeyAuth)
 
 class iso _TestErrorStrings is UnitTest
   fun name(): String => "ssh_error/error_strings"

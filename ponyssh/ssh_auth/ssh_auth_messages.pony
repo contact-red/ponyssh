@@ -6,6 +6,7 @@ primitive SshAuthMsgTypes
   fun userauth_failure(): U8 => 51
   fun userauth_success(): U8 => 52
   fun userauth_banner(): U8 => 53
+  fun userauth_pk_ok(): U8 => 60
   fun service_request(): U8 => 5
   fun service_accept(): U8 => 6
 
@@ -60,6 +61,13 @@ primitive SshAuthMessages
 
   fun userauth_success(): Array[U8] val =>
     recover val [as U8: SshAuthMsgTypes.userauth_success()] end
+
+  fun userauth_pk_ok(algorithm: String val, public_key: Array[U8] val): Array[U8] val =>
+    let w = SshWireWriter
+    w.write_byte(SshAuthMsgTypes.userauth_pk_ok())
+    w.write_string_from_str(algorithm)
+    w.write_string(public_key)
+    w.val_bytes()
 
   fun userauth_failure(methods: Array[String val] val, partial: Bool): Array[U8] val =>
     let w = SshWireWriter

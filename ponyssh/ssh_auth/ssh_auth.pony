@@ -1,4 +1,6 @@
 use "../ssh_error"
+use "../ssh_crypto"
+use "../ssh_transport"
 
 class val SshAuthRequest
   """Structured auth request for server consumer."""
@@ -55,6 +57,7 @@ class SshAuthStateMachine
   let _methods: Array[SshAuthMethod val] val
   var _current_index: USize = 0
   let _username: String val
+  var _current_keypair: (SshHostKeyPair | None) = None
 
   new create(username: String val, methods: Array[SshAuthMethod val] val) =>
     _username = username
@@ -69,20 +72,80 @@ class SshAuthStateMachine
     | let _: SshNoneAuth =>
       SshAuthMessages.userauth_request_none(_username, "ssh-connection")
     | let pw: SshPasswordAuth =>
-      SshAuthMessages.userauth_request_password(_username, "ssh-connection", pw.password)
-    | let _: SshPublicKeyAuth =>
-      // For now, just send a none request as placeholder
-      // Full implementation requires loading the key and signing
-      SshAuthMessages.userauth_request_none(_username, "ssh-connection")
+      SshAuthMessages.userauth_request_password(_username, "ssh-connection",
+        pw.password)
+    | let pk: SshPublicKeyAuth =>
+      // Send publickey query (no signature) to check if server accepts this key
+      try
+        let keypair = SshHostKeyPair(pk.private_key_data)?
+        let pub_key = keypair.public_key()
+        let pub_blob = _make_pub_blob(pub_key)
+        _current_keypair = keypair
+        SshAuthMessages.userauth_request_publickey(
+          _username, "ssh-connection", pub_key.algorithm, pub_blob)
+      else
+        // Key loading failed, skip to next method
+        _current_index = _current_index + 1
+        next_request()
+      end
     | None =>
+      SshAuthRejected
+    end
+
+  fun ref handle_pk_ok(session_id: Array[U8] val):
+    (Array[U8] val | SshAuthRejected)
+  =>
+    """
+    Server accepted our public key query. Now send the actual auth with
+    signature per RFC 4252 section 7.
+    """
+    match _current_keypair
+    | let keypair: SshHostKeyPair =>
+      let pub_key = keypair.public_key()
+      let pub_blob = _make_pub_blob(pub_key)
+      // Data to sign: string(session_id) || byte(50) || string(username)
+      //   || string(service) || string("publickey") || bool(true)
+      //   || string(algorithm) || string(pub_blob)
+      let w = SshWireWriter
+      w.write_string(session_id)
+      w.write_byte(SshAuthMsgTypes.userauth_request())
+      w.write_string_from_str(_username)
+      w.write_string_from_str("ssh-connection")
+      w.write_string_from_str("publickey")
+      w.write_bool(true)
+      w.write_string_from_str(pub_key.algorithm)
+      w.write_string(pub_blob)
+      let sign_data = w.val_bytes()
+
+      match keypair.sign(sign_data)
+      | let raw_sig: Array[U8] val =>
+        // Wrap signature: string(algorithm) || string(raw_sig)
+        let sig_w = SshWireWriter
+        sig_w.write_string_from_str(pub_key.algorithm)
+        sig_w.write_string(raw_sig)
+        let sig_blob = sig_w.val_bytes()
+        SshAuthMessages.userauth_request_publickey(
+          _username, "ssh-connection", pub_key.algorithm, pub_blob, sig_blob)
+      | let _: SshCryptoError =>
+        SshAuthRejected
+      end
+    else
       SshAuthRejected
     end
 
   fun ref handle_failure(): (Array[U8] val | SshAuthRejected) =>
     """Move to next method and generate request, or fail."""
+    _current_keypair = None
     _current_index = _current_index + 1
     next_request()
 
   fun ref handle_success(): None =>
     """Auth succeeded. Nothing to do."""
     None
+
+  fun _make_pub_blob(pub_key: SshHostKey val): Array[U8] val =>
+    """Build SSH public key blob: string(algorithm) || string(raw_key_data)."""
+    let w = SshWireWriter
+    w.write_string_from_str(pub_key.algorithm)
+    w.write_string(pub_key.public_key_data)
+    w.val_bytes()
