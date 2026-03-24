@@ -1,6 +1,8 @@
 use "encode/base64"
 use "lori"
 use "buffered"
+use "files"
+use "terminfo"
 use "../../ponyssh/ssh_transport"
 use "../../ponyssh/ssh_crypto"
 use "../../ponyssh/ssh_error"
@@ -58,6 +60,8 @@ actor EchoServerNotify is SshServerNotify
   let _authorized_key: Array[U8] val = _AuthorizedKey()
   var _last_username: String val = ""
   var _reader: Reader = Reader
+  var _terminfo: (TermInfo | None) = None
+  var _pty: (SshPtyState val | None) = None
 
   new create(env: Env) => _env = env
 
@@ -127,8 +131,13 @@ actor EchoServerNotify is SshServerNotify
   be ssh_pty_request(session: SshSession tag, channel_id: U32,
     pty: SshPtyState val, want_reply: Bool)
   =>
+    _pty = pty
+    parse_term_info()
+
     _env.out.print("PTY request: " + pty.term
-      + " " + pty.width_chars.string() + "x" + pty.height_rows.string())
+      + " " + pty.width_chars.string() + "x" + pty.height_rows.string()
+      + " " + pty.width_pixels.string() + "x" + pty.height_pixels.string()
+  )
     if want_reply then
       session.accept_request(channel_id)
     end
@@ -140,7 +149,15 @@ actor EchoServerNotify is SshServerNotify
     if want_reply then
       session.accept_request(channel_id)
     end
-    let msg: String val = "Welcome to ponyssh echo server, " + _last_username + "!\r\n"
+
+    let msg: String val =
+      match _pty
+      | let p: SshPtyState =>
+        "SHELLWelcome to ponyssh echo server, " + _last_username + "!\r\n"
+        + " " + p.term + ": " + p.width_chars.string() + "x" + p.height_rows.string()
+      else
+        "No PTY yo!"
+      end
     let greeting: Array[U8] val = recover val
       let a = Array[U8](msg.size())
       for ch in msg.values() do a.push(ch) end
@@ -151,7 +168,10 @@ actor EchoServerNotify is SshServerNotify
   be ssh_window_change(session: SshSession tag, channel_id: U32,
     width_chars: U32, height_rows: U32, width_pixels: U32, height_pixels: U32)
   =>
-    _env.out.print("Window change: " + width_chars.string() + "x" + height_rows.string())
+    _pty =
+      match _pty
+      | let op: SshPtyState val => SshPtyState.with_dimensions(op, width_chars, height_rows, width_pixels, height_pixels)
+      end
 
   be ssh_channel_request(session: SshSession tag, channel_id: U32,
     request_type: String val, want_reply: Bool)
@@ -208,3 +228,58 @@ actor EchoServerNotify is SshServerNotify
 
   be ssh_disconnected(session: SshSession tag) =>
     _env.out.print("Client disconnected")
+
+  fun ref parse_term_info() =>
+    let term = match _pty
+    | let p: SshPtyState val => p.term
+    else return
+    end
+
+    let dirs = recover val
+      let a = Array[String val]
+      // Standard terminfo search order
+      try a.push(_env_var("TERMINFO")?) end
+      let home = try _env_var("HOME")? else "" end
+      if home.size() > 0 then a.push(home + "/.terminfo") end
+      try
+        let tdirs = _env_var("TERMINFO_DIRS")?
+        for d in tdirs.split(":").values() do
+          if d.size() > 0 then a.push(d) end
+        end
+      end
+      a.push("/usr/share/terminfo")
+      a.push("/usr/lib/terminfo")
+      a
+    end
+
+    let first_char = try
+      String.from_array(recover val [term(0)?] end)
+    else return
+    end
+
+    let auth = FileAuth(_env.root)
+    for dir in dirs.values() do
+      let path = FilePath(auth, dir + "/" + first_char + "/" + term)
+      match OpenFile(path)
+      | let file: File =>
+        match TIParser.parse(file)
+        | let ti: TermInfo =>
+          _terminfo = ti
+          _env.out.print("  terminfo loaded for " + term)
+          return
+        | let e: TIParseError =>
+          _env.out.print("  terminfo parse error: " + e.string())
+        end
+      end
+    end
+    _env.out.print("  terminfo not found for " + term)
+
+  fun _env_var(key: String): String ? =>
+    """Look up an environment variable from Env.vars (Array of KEY=VALUE strings)."""
+    let prefix: String val = key + "="
+    for entry in _env.vars.values() do
+      if entry.at(prefix) then
+        return entry.substring(prefix.size().isize())
+      end
+    end
+    error
