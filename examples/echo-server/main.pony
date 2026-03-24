@@ -124,21 +124,41 @@ actor EchoServerNotify is SshServerNotify
     _env.out.print("Channel open: " + channel_type)
     session.accept_channel(channel_id)
 
+  be ssh_pty_request(session: SshSession tag, channel_id: U32,
+    pty: SshPtyState val, want_reply: Bool)
+  =>
+    _env.out.print("PTY request: " + pty.term
+      + " " + pty.width_chars.string() + "x" + pty.height_rows.string())
+    if want_reply then
+      session.accept_request(channel_id)
+    end
+
+  be ssh_shell_request(session: SshSession tag, channel_id: U32,
+    want_reply: Bool)
+  =>
+    _env.out.print("Shell request")
+    if want_reply then
+      session.accept_request(channel_id)
+    end
+    let msg: String val = "Welcome to ponyssh echo server, " + _last_username + "!\r\n"
+    let greeting: Array[U8] val = recover val
+      let a = Array[U8](msg.size())
+      for ch in msg.values() do a.push(ch) end
+      a
+    end
+    session.channel_send(channel_id, greeting)
+
+  be ssh_window_change(session: SshSession tag, channel_id: U32,
+    width_chars: U32, height_rows: U32, width_pixels: U32, height_pixels: U32)
+  =>
+    _env.out.print("Window change: " + width_chars.string() + "x" + height_rows.string())
+
   be ssh_channel_request(session: SshSession tag, channel_id: U32,
     request_type: String val, want_reply: Bool)
   =>
     _env.out.print("Channel request: " + request_type)
     if want_reply then
       session.accept_request(channel_id)
-    end
-    if request_type == "shell" then
-      let msg: String val = "Welcome to ponyssh echo server, " + _last_username + "!\r\n"
-      let greeting: Array[U8] val = recover val
-        let a = Array[U8](msg.size())
-        for ch in msg.values() do a.push(ch) end
-        a
-      end
-      session.channel_send(channel_id, greeting)
     end
 
   be ssh_channel_data(session: SshSession tag, channel_id: U32,

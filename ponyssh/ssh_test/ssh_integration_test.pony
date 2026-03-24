@@ -89,6 +89,21 @@ actor _IntegrationServerNotify is SshServerNotify
   =>
     session.accept_channel(channel_id)
 
+  be ssh_pty_request(session: SshSession tag, channel_id: U32,
+    pty: SshPtyState val, want_reply: Bool)
+  =>
+    if want_reply then session.accept_request(channel_id) end
+
+  be ssh_shell_request(session: SshSession tag, channel_id: U32,
+    want_reply: Bool)
+  =>
+    if want_reply then session.accept_request(channel_id) end
+
+  be ssh_window_change(session: SshSession tag, channel_id: U32,
+    width_chars: U32, height_rows: U32, width_pixels: U32, height_pixels: U32)
+  =>
+    None
+
   be ssh_channel_request(session: SshSession tag, channel_id: U32,
     request_type: String val, want_reply: Bool)
   =>
