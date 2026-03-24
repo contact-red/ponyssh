@@ -57,6 +57,13 @@ actor Main is TestList
     test(_TestChacha20Poly1305Corrupted)
     test(_TestIntegrationHandshake)
     test(_TestIntegrationPubkeyAuth)
+    test(_TestPtyIcrnlLoneCr)
+    test(_TestPtyIcrnlPreservesCrLf)
+    test(_TestPtyIcrnlLoneCrReplaced)
+    test(_TestPtyNoTransformWithoutIcrnl)
+    test(_TestPtyIcrnlDisabledByZeroValue)
+    test(_TestPtyModeParseRoundtrip)
+    test(_TestPtyModeParseEmpty)
 
 class iso _TestErrorStrings is UnitTest
   fun name(): String => "ssh_error/error_strings"

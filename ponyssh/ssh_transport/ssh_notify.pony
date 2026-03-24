@@ -19,6 +19,12 @@ interface SshServerNotify
   be ssh_auth_request(session: SshSession tag, request: SshAuthRequest val)
   be ssh_session_ready(session: SshSession tag)
   be ssh_channel_open_request(session: SshSession tag, channel_id: U32, channel_type: String val)
+  be ssh_pty_request(session: SshSession tag, channel_id: U32,
+    pty: SshPtyState val, want_reply: Bool)
+  be ssh_shell_request(session: SshSession tag, channel_id: U32,
+    want_reply: Bool)
+  be ssh_window_change(session: SshSession tag, channel_id: U32,
+    width_chars: U32, height_rows: U32, width_pixels: U32, height_pixels: U32)
   be ssh_channel_request(session: SshSession tag, channel_id: U32,
     request_type: String val, want_reply: Bool)
   be ssh_channel_data(session: SshSession tag, channel_id: U32, data: Array[U8] val)
