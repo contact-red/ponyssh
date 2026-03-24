@@ -105,7 +105,3 @@ class val SshPtyState
       end
       out
     end
-
-  fun val parse_modes(mode_data: Array[U8] val): Array[(U8, U32)] val ? =>
-    """Parse RFC 4254 §8 encoded terminal modes from raw bytes."""
-    SshTerminalModes.parse_modes(mode_data)?

@@ -200,6 +200,7 @@ actor SshSession
     | let _: SshStateConnected =>
       match _channel_manager.get(channel_id)
       | let ch: SshChannelState =>
+        ch.pty_pending = false
         _send_packet(SshChannelMessages.channel_success(ch.remote_id))
       end
     end
@@ -209,7 +210,10 @@ actor SshSession
     | let _: SshStateConnected =>
       match _channel_manager.get(channel_id)
       | let ch: SshChannelState =>
-        ch.pty = None
+        if ch.pty_pending then
+          ch.pty = None
+          ch.pty_pending = false
+        end
         _send_packet(SshChannelMessages.channel_failure(ch.remote_id))
       end
     end
@@ -912,9 +916,11 @@ actor SshSession
             let modes = SshTerminalModes.parse_modes(mode_data)?
             let pty = SshPtyState(term, width_chars, height_rows,
               width_pixels, height_pixels, modes)
-            // Store optimistically
+            // Store optimistically; mark pending until accept/reject
             match _channel_manager.get(recipient_channel)
-            | let ch: SshChannelState => ch.pty = pty
+            | let ch: SshChannelState =>
+              ch.pty = pty
+              ch.pty_pending = true
             end
             n.ssh_pty_request(this, recipient_channel, pty, want_reply)
           elseif request_type == "shell" then

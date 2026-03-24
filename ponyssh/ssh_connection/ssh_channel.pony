@@ -7,6 +7,7 @@ class SshChannelState
   let channel_type: String val
   var open: Bool = true
   var pty: (SshPtyState val | None) = None
+  var pty_pending: Bool = false
 
   new create(local_id': U32, remote_id': U32,
     local_window': U32, remote_window': U32,
