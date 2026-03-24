@@ -125,3 +125,55 @@ class iso _TestPtyIcrnlDisabledByZeroValue is UnitTest
     else
       h.fail("index out of bounds")
     end
+
+class iso _TestPtyModeParseRoundtrip is UnitTest
+  """Property: encoded modes round-trip through parse correctly."""
+  fun name(): String => "ssh_pty/mode_parse_roundtrip"
+
+  fun apply(h: TestHelper) ? =>
+    // Generate a list of (opcode 1-159, value) pairs
+    let opcode_gen = recover val Generators.u8(1, 159) end
+    let value_gen = recover val Generators.u32() end
+    let pair_gen = recover val Generators.zip2[U8, U32](opcode_gen, value_gen) end
+    let list_gen = recover val
+      Generators.iso_seq_of[(U8, U32), Array[(U8, U32)] iso](pair_gen, 0, 20)
+    end
+    PonyCheck.for_all[Array[(U8, U32)] iso](list_gen, h)(
+      {(sample: Array[(U8, U32)] iso, ph: PropertyHelper) ? =>
+        let pairs: Array[(U8, U32)] val = consume sample
+        // Encode: each pair is opcode (U8) + value (U32 big-endian), then TTY_OP_END
+        let w = SshWireWriter
+        for (opcode, value) in pairs.values() do
+          w.write_byte(opcode)
+          w.write_u32(value)
+        end
+        w.write_byte(SshTerminalModes.tty_op_end())
+        let encoded = w.val_bytes()
+
+        // Parse
+        let parsed = SshTerminalModes.parse_modes(encoded)?
+
+        // Verify
+        ph.assert_eq[USize](parsed.size(), pairs.size())
+        var i: USize = 0
+        while i < pairs.size() do
+          let exp = pairs(i)?
+          let act = parsed(i)?
+          ph.assert_eq[U8](act._1, exp._1)
+          ph.assert_eq[U32](act._2, exp._2)
+          i = i + 1
+        end
+      })?
+
+class iso _TestPtyModeParseEmpty is UnitTest
+  """Empty modes (just TTY_OP_END) parses to empty array."""
+  fun name(): String => "ssh_pty/mode_parse_empty"
+
+  fun apply(h: TestHelper) =>
+    let encoded: Array[U8] val = recover val [as U8: 0] end
+    try
+      let parsed = SshTerminalModes.parse_modes(encoded)?
+      h.assert_eq[USize](0, parsed.size())
+    else
+      h.fail("parse_modes raised error on valid input")
+    end
