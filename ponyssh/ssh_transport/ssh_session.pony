@@ -209,6 +209,7 @@ actor SshSession
     | let _: SshStateConnected =>
       match _channel_manager.get(channel_id)
       | let ch: SshChannelState =>
+        ch.pty = None
         _send_packet(SshChannelMessages.channel_failure(ch.remote_id))
       end
     end
@@ -864,7 +865,15 @@ actor SshSession
         let recipient_channel = r.read_u32()?
         let data = r.read_string()?
         _channel_manager.channel_data_received(recipient_channel, data.size())
-        _notify_channel_data(recipient_channel, data)
+        let transformed = match _channel_manager.get(recipient_channel)
+        | let ch: SshChannelState =>
+          match ch.pty
+          | let pty: SshPtyState val => pty.transform(data)
+          | None => data
+          end
+        | None => data
+        end
+        _notify_channel_data(recipient_channel, transformed)
       end
     | SshChannelMsgTypes.channel_window_adjust() =>
       try
@@ -893,7 +902,42 @@ actor SshSession
         let want_reply = r.read_bool()?
         match _server_notify
         | let n: SshServerNotify tag =>
-          n.ssh_channel_request(this, recipient_channel, request_type, want_reply)
+          if request_type == "pty-req" then
+            let term = r.read_string_as_str()?
+            let width_chars = r.read_u32()?
+            let height_rows = r.read_u32()?
+            let width_pixels = r.read_u32()?
+            let height_pixels = r.read_u32()?
+            let mode_data = r.read_string()?
+            let modes = SshTerminalModes.parse_modes(mode_data)?
+            let pty = SshPtyState(term, width_chars, height_rows,
+              width_pixels, height_pixels, modes)
+            // Store optimistically
+            match _channel_manager.get(recipient_channel)
+            | let ch: SshChannelState => ch.pty = pty
+            end
+            n.ssh_pty_request(this, recipient_channel, pty, want_reply)
+          elseif request_type == "shell" then
+            n.ssh_shell_request(this, recipient_channel, want_reply)
+          elseif request_type == "window-change" then
+            let width_chars = r.read_u32()?
+            let height_rows = r.read_u32()?
+            let width_pixels = r.read_u32()?
+            let height_pixels = r.read_u32()?
+            match _channel_manager.get(recipient_channel)
+            | let ch: SshChannelState =>
+              match ch.pty
+              | let old_pty: SshPtyState val =>
+                ch.pty = SshPtyState.with_dimensions(old_pty,
+                  width_chars, height_rows, width_pixels, height_pixels)
+              end
+            end
+            n.ssh_window_change(this, recipient_channel,
+              width_chars, height_rows, width_pixels, height_pixels)
+          else
+            n.ssh_channel_request(this, recipient_channel, request_type,
+              want_reply)
+          end
         end
       end
     | SshChannelMsgTypes.channel_success() => None
