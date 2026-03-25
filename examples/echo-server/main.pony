@@ -1,8 +1,9 @@
-use "encode/base64"
 use "lori"
-use "buffered"
 use "files"
+use "buffered"
 use "terminfo"
+use "collections"
+use "encode/base64"
 use "../../ponyssh/ssh_transport"
 use "../../ponyssh/ssh_crypto"
 use "../../ponyssh/ssh_error"
@@ -63,223 +64,40 @@ actor EchoServerNotify is SshServerNotify
   var _terminfo: (TermInfo | None) = None
   var _pty: (SshPtyState val | None) = None
 
-  new create(env: Env) => _env = env
+  fun get_vars(): Array[String val] val => _env.vars
+  fun get_fileauth(): FileAuth => FileAuth(_env.root)
+  fun get_pty(): (SshPtyState val | None) => _pty
+  fun ref set_pty(pty: (SshPtyState val | None)) => _pty = pty
+  fun get_terminfo(): (TermInfo val | None) => _terminfo
+  fun ref set_terminfo(ti: TermInfo val) => _terminfo = ti
 
-  be ssh_session_started(session: SshSession tag) =>
-    _env.out.print("New connection")
+  new create(env: Env) =>
+    _env = env
 
-  be ssh_auth_request(session: SshSession tag, request: SshAuthRequest val) =>
-    _env.out.print("Auth from: " + request.username + " (" + request.method + ")")
-    match request.method_data
-    | let pw: SshAuthPasswordData val =>
-      if pw.password == "wibble" then
-        _last_username = request.username
-        session.auth_accept()
+  fun validate_password(user: String val, password: String val): Bool => false
+  fun validate_publickey(user: String val, pk: SshAuthPublicKeyData val): Bool =>
+    SshMac.verify(pk.public_key, _AuthorizedKey())
+
+  fun ref ssh_shell_appstart(session: SshSession tag, channel_id: U32) =>
+    let pty: SshPtyState val =
+      try
+        (get_pty() as SshPtyState)
       else
-        _env.out.print("  wrong password")
-        let remaining = recover val
-          let a = Array[String val]
-          a.push("publickey")
-          a.push("password")
-          a
-        end
-        session.auth_reject(remaining)
-      end
-    | let pk: SshAuthPublicKeyData val =>
-      // Check if offered key matches our authorized key (constant-time)
-      if not SshMac.verify(pk.public_key, _authorized_key) then
-        _env.out.print("  publickey rejected — unknown key")
-        let remaining = recover val
-          let a = Array[String val]
-          a.push("publickey")
-          a.push("password")
-          a
-        end
-        session.auth_reject(remaining)
+        session.disconnect("No SshPtyState")
         return
       end
-      match pk.signature
-      | None =>
-        // Query: client asks if this key is acceptable.
-        _env.out.print("  publickey query for " + pk.algorithm + " — key recognized")
-        session.auth_pk_ok(pk.algorithm, pk.public_key)
-      | let _: Array[U8] val =>
-        // Actual auth with signature from a recognized key.
-        _env.out.print("  publickey auth with " + pk.algorithm + " — accepted")
-        _last_username = request.username
-        session.auth_accept()
-      end
-    else
-      // Reject other methods, offer publickey and password
-      let remaining = recover val
-        let a = Array[String val]
-        a.push("publickey")
-        a.push("password")
-        a
-      end
-      session.auth_reject(remaining)
-    end
 
-  be ssh_session_ready(session: SshSession tag) => None
-
-  be ssh_channel_open_request(session: SshSession tag, channel_id: U32,
-    channel_type: String val)
-  =>
-    _env.out.print("Channel open: " + channel_type)
-    session.accept_channel(channel_id)
-
-  be ssh_pty_request(session: SshSession tag, channel_id: U32,
-    pty: SshPtyState val, want_reply: Bool)
-  =>
-    _pty = pty
-    parse_term_info()
-
-    _env.out.print("PTY request: " + pty.term
-      + " " + pty.width_chars.string() + "x" + pty.height_rows.string()
-      + " " + pty.width_pixels.string() + "x" + pty.height_pixels.string()
-  )
-    if want_reply then
-      session.accept_request(channel_id)
-    end
-
-  be ssh_shell_request(session: SshSession tag, channel_id: U32,
-    want_reply: Bool)
-  =>
-    _env.out.print("Shell request")
-    if want_reply then
-      session.accept_request(channel_id)
-    end
-
-    let msg: String val =
-      match _pty
-      | let p: SshPtyState =>
-        "SHELLWelcome to ponyssh echo server, " + _last_username + "!\r\n"
-        + " " + p.term + ": " + p.width_chars.string() + "x" + p.height_rows.string()
-      else
-        "No PTY yo!"
-      end
-    let greeting: Array[U8] val = recover val
-      let a = Array[U8](msg.size())
-      for ch in msg.values() do a.push(ch) end
-      a
-    end
-    session.channel_send(channel_id, greeting)
-
-  be ssh_window_change(session: SshSession tag, channel_id: U32,
-    width_chars: U32, height_rows: U32, width_pixels: U32, height_pixels: U32)
-  =>
-    _pty =
-      match _pty
-      | let op: SshPtyState val => SshPtyState.with_dimensions(op, width_chars, height_rows, width_pixels, height_pixels)
-      end
-
-  be ssh_channel_request(session: SshSession tag, channel_id: U32,
-    request_type: String val, want_reply: Bool)
-  =>
-    _env.out.print("Channel request: " + request_type)
-    if want_reply then
-      session.accept_request(channel_id)
-    end
-
-  be ssh_channel_data(session: SshSession tag, channel_id: U32,
-    data: Array[U8] val)
-  =>
-    let input = String.from_array(data)
-    _reader.append(input)
-    var line: String val = ""
-    for chr in data.values() do
-      _env.out.print("chr: " + chr.string())
-    end
-    _env.out.print("R: " + input)
-    try
-      while (true) do
-        line = _reader.line()?
-        _env.out.print("line: " + line)
-        session.channel_send(channel_id, line.array())
-      end
-    else
-      _env.out.print("Size: " + _reader.size().string())
-    end
-
-    if input.contains("/quit") then
-      let bye: Array[U8] val = recover val
-        let msg = "Goodbye!\r\n"
-        let a = Array[U8](msg.size())
-        for ch in msg.values() do a.push(ch) end
-        a
-      end
-      session.channel_send(channel_id, bye)
-      session.disconnect()
-    else
-      // Echo back
-      session.channel_send(channel_id, data)
-    end
-
-  be ssh_channel_error(session: SshSession tag, channel_id: U32,
-    err: SshChannelError val)
-  =>
-    _env.out.print("Channel error: " + err.string())
-
-  be ssh_channel_closed(session: SshSession tag, channel_id: U32) =>
-    _env.out.print("Channel closed")
-
-  be ssh_error(session: SshSession tag, err: SshTransportError val) =>
-    _env.out.print("Error: " + err.string())
-
-  be ssh_disconnected(session: SshSession tag) =>
-    _env.out.print("Client disconnected")
-
-  fun ref parse_term_info() =>
-    let term = match _pty
-    | let p: SshPtyState val => p.term
-    else return
-    end
-
-    let dirs = recover val
-      let a = Array[String val]
-      // Standard terminfo search order
-      try a.push(_env_var("TERMINFO")?) end
-      let home = try _env_var("HOME")? else "" end
-      if home.size() > 0 then a.push(home + "/.terminfo") end
+    let terminfo: TermInfo val =
       try
-        let tdirs = _env_var("TERMINFO_DIRS")?
-        for d in tdirs.split(":").values() do
-          if d.size() > 0 then a.push(d) end
-        end
+        (get_terminfo() as TermInfo)
+      else
+        session.disconnect("No supported TermInfo")
+        return
       end
-      a.push("/usr/share/terminfo")
-      a.push("/usr/lib/terminfo")
-      a
+
+    try session.channel_send(channel_id, terminfo.clear_screen()?) end
+    for col in Range[I32](0,255) do
+      try session.channel_send(channel_id, terminfo.set_foreground(col)?) end
+      session.channel_send(channel_id, ("Hello World!" + col.string()).array())
     end
 
-    let first_char = try
-      String.from_array(recover val [term(0)?] end)
-    else return
-    end
-
-    let auth = FileAuth(_env.root)
-    for dir in dirs.values() do
-      let path = FilePath(auth, dir + "/" + first_char + "/" + term)
-      match OpenFile(path)
-      | let file: File =>
-        match TIParser.parse(file)
-        | let ti: TermInfo =>
-          _terminfo = ti
-          _env.out.print("  terminfo loaded for " + term)
-          return
-        | let e: TIParseError =>
-          _env.out.print("  terminfo parse error: " + e.string())
-        end
-      end
-    end
-    _env.out.print("  terminfo not found for " + term)
-
-  fun _env_var(key: String): String ? =>
-    """Look up an environment variable from Env.vars (Array of KEY=VALUE strings)."""
-    let prefix: String val = key + "="
-    for entry in _env.vars.values() do
-      if entry.at(prefix) then
-        return entry.substring(prefix.size().isize())
-      end
-    end
-    error

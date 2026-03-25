@@ -139,10 +139,10 @@ actor SshSession
   be reject_host_key() =>
     _disconnect_with_error(SshProtocolVersionMismatch)
 
-  be disconnect() =>
+  be disconnect(msg: String val = "") =>
     """Clean disconnect initiated by consumer."""
     _send_packet(SshMessages.disconnect(
-      SshDisconnectCodes.by_application(), "disconnect by application"))
+      SshDisconnectCodes.by_application(), msg))
     _close_bridge()
     _state = SshStateDisconnected(None)
     _notify_disconnected()
