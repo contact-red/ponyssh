@@ -71,6 +71,11 @@ actor _IntegrationServerNotify is SshServerNotify
   let _h: TestHelper
   var _listener: (SshListener tag | None) = None
 
+  // stubbies
+  fun get_pty(): SshPtyState val => SshPtyState.none()
+  fun ref set_pty(x: SshPtyState val) => None
+  // end stubbies
+
   new create(h: TestHelper) =>
     _h = h
 

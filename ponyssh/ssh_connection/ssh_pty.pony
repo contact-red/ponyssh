@@ -42,6 +42,15 @@ class val SshPtyState
     height_pixels = height_pixels'
     modes = modes'
 
+  new val none() =>
+    term = ""
+    width_chars = 0
+    height_rows = 0
+    width_pixels = 0
+    height_pixels = 0
+    modes = []
+
+
   new val with_dimensions(original: SshPtyState val, width_chars': U32,
     height_rows': U32, width_pixels': U32, height_pixels': U32)
   =>

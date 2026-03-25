@@ -34,6 +34,36 @@ actor Main
     let auth = TCPListenAuth(env.root)
     SshListener(auth, config, EchoServerNotify(env))
 
+actor EchoServerNotify is SshServerNotify
+  let _env: Env
+  let _authorized_key: Array[U8] val = _AuthorizedKey()
+  var _last_username: String val = ""
+  var _reader: Reader = Reader
+  var _terminfo: TermInfo val = TermInfo.none()
+  var _pty: SshPtyState val = SshPtyState.none()
+
+  fun get_pty(): SshPtyState val => _pty
+  fun ref set_pty(pty: SshPtyState val) => _pty = pty
+
+  new create(env: Env) =>
+    _env = env
+
+  fun validate_password(user: String val, password: String val): Bool =>
+    // Don't do this™
+    (password == "wibble")
+
+  fun validate_publickey(user: String val, pk: SshAuthPublicKeyData val): Bool =>
+    SshMac.verify(pk.public_key, _AuthorizedKey())
+
+  fun ref ssh_shell_appstart(session: SshSession tag, channel_id: U32) =>
+    _terminfo = TermInfos.parse_term_info(get_pty().term, FileAuth(_env.root), _env.vars)
+
+    try session.channel_send(channel_id, _terminfo.clear_screen()?) end
+    for col in Range[I32](0,255) do
+      try session.channel_send(channel_id, _terminfo.set_foreground(col)?) end
+      session.channel_send(channel_id, ("Hello World!" + col.string()).array())
+    end
+
 primitive _EchoServerKey
   fun apply(): Array[U8] val =>
     """Ed25519 private key for the echo server. Test-only, not for production."""
@@ -54,50 +84,5 @@ primitive _AuthorizedKey
         "AAAAC3NzaC1lZDI1NTE5AAAAIFt4LNU1hzaNa3ap5OIrKey19KHD8clnopA5BgODuVtx")?
     else
       recover val Array[U8] end
-    end
-
-actor EchoServerNotify is SshServerNotify
-  let _env: Env
-  let _authorized_key: Array[U8] val = _AuthorizedKey()
-  var _last_username: String val = ""
-  var _reader: Reader = Reader
-  var _terminfo: (TermInfo | None) = None
-  var _pty: (SshPtyState val | None) = None
-
-  fun get_vars(): Array[String val] val => _env.vars
-  fun get_fileauth(): FileAuth => FileAuth(_env.root)
-  fun get_pty(): (SshPtyState val | None) => _pty
-  fun ref set_pty(pty: (SshPtyState val | None)) => _pty = pty
-  fun get_terminfo(): (TermInfo val | None) => _terminfo
-  fun ref set_terminfo(ti: TermInfo val) => _terminfo = ti
-
-  new create(env: Env) =>
-    _env = env
-
-  fun validate_password(user: String val, password: String val): Bool => false
-  fun validate_publickey(user: String val, pk: SshAuthPublicKeyData val): Bool =>
-    SshMac.verify(pk.public_key, _AuthorizedKey())
-
-  fun ref ssh_shell_appstart(session: SshSession tag, channel_id: U32) =>
-    let pty: SshPtyState val =
-      try
-        (get_pty() as SshPtyState)
-      else
-        session.disconnect("No SshPtyState")
-        return
-      end
-
-    let terminfo: TermInfo val =
-      try
-        (get_terminfo() as TermInfo)
-      else
-        session.disconnect("No supported TermInfo")
-        return
-      end
-
-    try session.channel_send(channel_id, terminfo.clear_screen()?) end
-    for col in Range[I32](0,255) do
-      try session.channel_send(channel_id, terminfo.set_foreground(col)?) end
-      session.channel_send(channel_id, ("Hello World!" + col.string()).array())
     end
 

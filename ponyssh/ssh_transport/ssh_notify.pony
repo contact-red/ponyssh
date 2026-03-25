@@ -1,5 +1,3 @@
-use "files"
-use "terminfo"
 use "../ssh_error"
 use "../ssh_crypto"
 use "../ssh_connection"
@@ -17,12 +15,8 @@ interface SshClientNotify
   be ssh_disconnected(session: SshSession tag)
 
 interface SshServerNotify
-  fun get_vars(): Array[String val] val
-  fun get_fileauth(): FileAuth
-  fun get_pty(): (SshPtyState val | None)
-  fun ref set_pty(pty: (SshPtyState val | None)) => None
-  fun get_terminfo(): (TermInfo val | None)
-  fun ref set_terminfo(ti: TermInfo val)
+  fun get_pty(): SshPtyState val
+  fun ref set_pty(pty: SshPtyState val) => None
 
   be ssh_session_started(session: SshSession tag) => None
   be ssh_session_ready(session: SshSession tag) => None
@@ -32,7 +26,7 @@ interface SshServerNotify
   be ssh_pty_request(session: SshSession tag, channel_id: U32,
     pty: SshPtyState val, want_reply: Bool) =>
     set_pty(pty)
-    parse_term_info()
+//    parse_term_info(pty.term)
 
     if want_reply then
       session.accept_request(channel_id)
@@ -50,11 +44,7 @@ interface SshServerNotify
 
   be ssh_window_change(session: SshSession tag, channel_id: U32,
     width_chars: U32, height_rows: U32, width_pixels: U32, height_pixels: U32) =>
-    set_pty(
-      match get_pty()
-      | let op: SshPtyState val =>
-        SshPtyState.with_dimensions(op, width_chars, height_rows, width_pixels, height_pixels)
-      end)
+    set_pty(SshPtyState.with_dimensions(get_pty(), width_chars, height_rows, width_pixels, height_pixels))
 
   be ssh_channel_request(session: SshSession tag, channel_id: U32,
     request_type: String val, want_reply: Bool) =>
@@ -93,7 +83,7 @@ interface SshServerNotify
     end
 
 /* FIXME These functions really need to move into primitives in the
-   terminfo package and the application being written.              */
+   terminfo package and the application being written. 
   fun env_var(key: String): String ? =>
     """Look up an environment variable from Env.vars (Array of KEY=VALUE strings)."""
     let prefix: String val = key + "="
@@ -104,12 +94,7 @@ interface SshServerNotify
     end
     error
 
-  fun ref parse_term_info() =>
-    let term = match get_pty()
-    | let p: SshPtyState val => p.term
-    else return
-    end
-
+  fun ref parse_term_info(term: String val): (TermInfo val | None) =>
     let dirs = recover val
       let a = Array[String val]
       // Standard terminfo search order
@@ -138,10 +123,9 @@ interface SshServerNotify
       | let file: File =>
         match TIParser.parse(file)
         | let ti: TermInfo =>
-          set_terminfo(ti)
-          return
+          return ti
         | let e: TIParseError => None
         end
       end
     end
- 
+*/ 

@@ -90,6 +90,11 @@ actor _PubkeyServerNotify is SshServerNotify
   let _authorized_key: Array[U8] val = _TestPubkeyAuthorized()
   var _listener: (SshListener tag | None) = None
 
+  // stubbies
+  fun get_pty(): SshPtyState val => SshPtyState.none()
+  fun ref set_pty(x: SshPtyState val) => None
+  // nomorestubbies
+
   new create(h: TestHelper) =>
     _h = h
 
