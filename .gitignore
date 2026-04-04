@@ -3,3 +3,4 @@ _repos/
 build/
 lock.json
 /ssh_test
+docs/
