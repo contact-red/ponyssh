@@ -1,0 +1,26 @@
+name: Linux ponyc update breakage test
+
+on:
+  # The ponylang org dispatches this event to its own repositories when the
+  # shared CI builder images are rebuilt. It is kept here so the workflow keeps
+  # working if ponyssh ever moves into that org. For this repository, the
+  # nightly schedule below is what actually exercises ponyc main.
+  repository_dispatch:
+    types:
+      - shared-docker-builders-updated
+  schedule:
+    - cron: "0 5 * * *"
+
+permissions:
+  packages: read
+
+jobs:
+  test-openssl-3-vs-ponyc-latest:
+    name: OpenSSL 3.x with ponyc main
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/ponylang/shared-docker-ci-standard-builder-with-openssl-3.6.2:nightly
+    steps:
+      - uses: actions/checkout@v6.0.2
+      - name: Test
+        run: make test config=debug ssl=3.0.x

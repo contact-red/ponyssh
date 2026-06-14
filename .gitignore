@@ -4,3 +4,7 @@ build/
 lock.json
 /ssh_test
 docs/
+
+# Local SSH keys used for manual testing against real clients
+/ponyssh-testing
+/ponyssh-testing.pub
