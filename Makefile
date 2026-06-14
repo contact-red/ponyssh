@@ -4,10 +4,12 @@ PACKAGE := ponyssh
 GET_DEPENDENCIES_WITH := corral fetch
 CLEAN_DEPENDENCIES_WITH := corral clean
 COMPILE_WITH := corral run -- ponyc
+BUILD_DOCS_WITH := corral run -- pony-doc
 
 BUILD_DIR ?= build/$(config)
 SRC_DIR ?= ponyssh
-tests_binary := $(BUILD_DIR)/ssh_test
+tests_binary := $(BUILD_DIR)/ponyssh
+docs_dir := build/ponyssh-docs
 
 ifdef config
 	ifeq (,$(filter $(config),debug release))
@@ -35,7 +37,7 @@ test-one: $(tests_binary)
 
 $(tests_binary): $(SOURCE_FILES) | $(BUILD_DIR)
 	$(GET_DEPENDENCIES_WITH)
-	$(PONYC) -o $(BUILD_DIR) $(SRC_DIR)/ssh_test
+	$(PONYC) -o $(BUILD_DIR) $(SRC_DIR)
 
 echo-server: | $(BUILD_DIR)
 	$(GET_DEPENDENCIES_WITH)
@@ -45,7 +47,15 @@ clean:
 	$(CLEAN_DEPENDENCIES_WITH)
 	rm -rf $(BUILD_DIR)
 
+$(docs_dir): $(SOURCE_FILES)
+	rm -rf $(docs_dir)
+	$(GET_DEPENDENCIES_WITH)
+	$(BUILD_DOCS_WITH) --output build $(SRC_DIR)
+	cp -r docs-theme/assets/* $(docs_dir)/docs/assets/
+
+docs: $(docs_dir)
+
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
-.PHONY: clean test unit-tests test-one echo-server
+.PHONY: clean test unit-tests test-one echo-server docs

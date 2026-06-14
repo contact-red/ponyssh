@@ -7,7 +7,7 @@
     "ponyssh/ssh_connection",
     "ponyssh/ssh_client",
     "ponyssh/ssh_server",
-    "ponyssh/ssh_test"
+    "ponyssh/tests"
   ],
   "deps": [
     {
