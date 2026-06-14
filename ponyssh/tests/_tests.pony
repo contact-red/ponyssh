@@ -1,21 +1,7 @@
-use "encode/base64"
 use "pony_test"
-use "pony_check"
 use "../ssh_error"
-use "../ssh_crypto"
-use "../ssh_transport"
-use "../ssh_auth"
-use "../ssh_connection"
-use "../ssh_client"
-use "../ssh_server"
 
-actor Main is TestList
-  new create(env: Env) =>
-    PonyTest(env, this)
-
-  new make() =>
-    None
-
+primitive \nodoc\ Tests is TestList
   fun tag tests(test: PonyTest) =>
     test(_TestErrorStrings)
     test(_TestCipherRoundtrip)

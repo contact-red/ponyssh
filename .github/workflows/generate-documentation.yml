@@ -28,7 +28,7 @@ jobs:
       - name: Generate documentation
         run: /entrypoint.py
         env:
-          INPUT_SITE_URL: "https://contact-red.github.io/ponyssh/"
+          INPUT_SITE_URL: "https://ponyssh.contact.red/"
           INPUT_LIBRARY_NAME: "ponyssh"
           INPUT_DOCS_BUILD_DIR: "build/ponyssh-docs"
       - name: Setup Pages
