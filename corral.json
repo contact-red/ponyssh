@@ -13,8 +13,7 @@
     {
       "locator": "github.com/ponylang/lori.git",
       "version": "0.15.0"
-    },
-    { "locator": "../terminfo" }
+    }
   ],
   "info": {
     "description": "Production-grade SSH-2 client/server library for Pony",
