@@ -40,30 +40,40 @@ actor Main
 actor EchoServerNotify is SshServerNotify
   let _env: Env
   let _authorized_key: Array[U8] val = _AuthorizedKey()
-  var _last_username: String val = ""
-  var _reader: Reader = Reader
-  var _terminfo: TermInfo val = TermInfo.none()
+  // Most recent pty for the shell we will start. A real server would track one
+  // per channel; this demo handles a single shell at a time.
   var _pty: SshPtyState val = SshPtyState.none()
-
-  fun get_pty(): SshPtyState val => _pty
-  fun ref set_pty(pty: SshPtyState val) => _pty = pty
 
   new create(env: Env) =>
     _env = env
 
   fun validate_password(user: String val, password: String val): Bool =>
     // Don't do this™
-    (password == "wibble")
+    password == "wibble"
 
   fun validate_publickey(user: String val, pk: SshAuthPublicKeyData val): Bool =>
-    SshMac.verify(pk.public_key, _AuthorizedKey())
+    pk.matches(_authorized_key)
 
-  fun ref ssh_shell_appstart(session: SshSession tag, channel_id: U32) =>
-    _terminfo = TermInfos.parse_term_info(get_pty().term, FileAuth(_env.root), _env.vars)
+  be ssh_channel_open_request(session: SshSession tag, channel_id: U32,
+    channel_type: String val)
+  =>
+    session.accept_channel(channel_id)
 
-    try session.channel_send(channel_id, _terminfo.clear_screen()?) end
-    for col in Range[I32](0,255) do
-      try session.channel_send(channel_id, _terminfo.set_foreground(col)?) end
+  be ssh_pty_request(session: SshSession tag, channel_id: U32,
+    pty: SshPtyState val, want_reply: Bool)
+  =>
+    _pty = pty
+    if want_reply then session.accept_request(channel_id) end
+
+  be ssh_shell_request(session: SshSession tag, channel_id: U32,
+    want_reply: Bool)
+  =>
+    if want_reply then session.accept_request(channel_id) end
+    let terminfo =
+      TermInfos.parse_term_info(_pty.term, FileAuth(_env.root), _env.vars)
+    try session.channel_send(channel_id, terminfo.clear_screen()?) end
+    for col in Range[I32](0, 255) do
+      try session.channel_send(channel_id, terminfo.set_foreground(col)?) end
       session.channel_send(channel_id, ("Hello World!" + col.string()).array())
     end
 

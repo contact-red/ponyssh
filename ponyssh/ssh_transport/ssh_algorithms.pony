@@ -72,22 +72,50 @@ primitive SshAlgorithmNegotiation
     end
     None
 
+primitive SshSupportedAlgorithms
+  """
+  The algorithms this transport can actually perform. Negotiation must not
+  commit to anything outside these sets: the key-exchange code runs X25519
+  unconditionally and the cipher code dispatches on these exact names, so a
+  negotiated name we cannot run would either die mid-handshake or, worse, leave
+  the negotiated name in the exchange hash disagreeing with the math performed.
+  """
+  fun kex(name: String val): Bool =>
+    (name == "curve25519-sha256")
+      or (name == "curve25519-sha256@libssh.org")
+
+  fun host_key(name: String val): Bool =>
+    name == "ssh-ed25519"
+
+  fun cipher(name: String val): Bool =>
+    (name == "chacha20-poly1305@openssh.com")
+      or (name == "aes256-gcm@openssh.com")
+      or (name == "aes128-gcm@openssh.com")
+      or (name == "aes256-ctr")
+      or (name == "aes128-cbc")
+
+  fun mac(name: String val): Bool =>
+    (name == "hmac-sha2-256") or (name == "hmac-sha2-512")
+
+  fun supports_all(n: SshNegotiatedAlgorithms val): Bool =>
+    """True only when every negotiated algorithm is one this transport runs."""
+    kex(n.kex) and host_key(n.host_key)
+      and cipher(n.cipher_c2s) and cipher(n.cipher_s2c)
+      and mac(n.mac_c2s) and mac(n.mac_s2c)
+
 primitive SshDefaultAlgorithms
   fun preferences(): SshAlgorithmPreferences val =>
+    // Advertise only what the transport actually implements. Offering
+    // algorithms we cannot perform (nistp256, DH groups, ECDSA/RSA host keys)
+    // lets a peer negotiate one and then watch the handshake die mid-exchange.
     let kex = recover val
       let a = Array[String val]
       a.push("curve25519-sha256")
-      a.push("ecdh-sha2-nistp256")
-      a.push("diffie-hellman-group16-sha512")
-      a.push("diffie-hellman-group14-sha256")
       a
     end
     let host_key = recover val
       let a = Array[String val]
       a.push("ssh-ed25519")
-      a.push("ecdsa-sha2-nistp256")
-      a.push("rsa-sha2-512")
-      a.push("rsa-sha2-256")
       a
     end
     let cipher = recover val

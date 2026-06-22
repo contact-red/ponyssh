@@ -51,8 +51,10 @@ class ref SshWireWriter
     let out = recover iso Array[U8](total) end
     for chunk in chunks.values() do
       match chunk
-      | let a: Array[U8] val => out.append(a)
-      | let s: String => out.append(s.array())
+      | let a: Array[U8] val => out.copy_from(a, 0, out.size(), a.size())
+      | let s: String =>
+        let sa = s.array()
+        out.copy_from(sa, 0, out.size(), sa.size())
       end
     end
     consume out

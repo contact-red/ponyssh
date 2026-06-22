@@ -35,6 +35,28 @@ class val SshAuthPublicKeyData
     public_key = public_key'
     signature = signature'
 
+  fun val matches(authorized_public_key_blob: Array[U8] val): Bool =>
+    """
+    True when the presented public key equals the given authorized public key
+    blob. The blob is the SSH wire encoding string(algorithm) || string(key) —
+    the same bytes found in an OpenSSH .pub file after base64-decoding the
+    middle field. Public keys are not secret, so a plain byte comparison is the
+    right tool; do not reach for a MAC/constant-time compare to test key
+    identity.
+    """
+    let a = public_key
+    let b = authorized_public_key_blob
+    if a.size() != b.size() then return false end
+    var i: USize = 0
+    while i < a.size() do
+      if (try a(i)? else return false end) != (try b(i)? else return false end)
+      then
+        return false
+      end
+      i = i + 1
+    end
+    true
+
 primitive SshAuthNoneData
 
 // Config types for client
