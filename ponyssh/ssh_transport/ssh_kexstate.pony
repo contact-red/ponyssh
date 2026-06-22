@@ -24,11 +24,26 @@ class SshKexStateMachine
       match SshMessages.decode_kexinit(their_payload)?
       | let their_prefs: SshAlgorithmPreferences val =>
         // Client preferences go first in negotiation per RFC 4253
-        match _role
-        | SshRoleClient =>
-          SshAlgorithmNegotiation.negotiate(our_prefs, their_prefs)
-        | SshRoleServer =>
-          SshAlgorithmNegotiation.negotiate(their_prefs, our_prefs)
+        let result = match _role
+          | SshRoleClient =>
+            SshAlgorithmNegotiation.negotiate(our_prefs, their_prefs)
+          | SshRoleServer =>
+            SshAlgorithmNegotiation.negotiate(their_prefs, our_prefs)
+          end
+        // A name common to both peers is only usable if this transport can
+        // actually run it. The key-exchange code runs X25519 unconditionally
+        // and the cipher code dispatches on exact names, so committing to an
+        // unimplemented-but-negotiated algorithm would die mid-handshake (or
+        // leave the negotiated name in the exchange hash disagreeing with the
+        // math performed). Reject up front instead.
+        match result
+        | let neg: SshNegotiatedAlgorithms val =>
+          if SshSupportedAlgorithms.supports_all(neg) then
+            neg
+          else
+            SshAlgorithmNegotiationFailed
+          end
+        | SshAlgorithmNegotiationFailed => SshAlgorithmNegotiationFailed
         end
       | None =>
         SshProtocolVersionMismatch

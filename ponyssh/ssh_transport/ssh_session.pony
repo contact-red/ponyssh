@@ -61,6 +61,25 @@ actor SshSession
   var _host_key: (SshHostKeyPair | None) = None
   var _our_kexinit: (Array[U8] val | None) = None
   var _encrypted: Bool = false
+  // The host the client was configured to connect to, passed to the host-key
+  // verification callback so the consumer can bind the key to a hostname
+  // (known_hosts / TOFU). Empty on the server side.
+  var _remote_host: String val = ""
+  // Set once teardown has begun, so the per-packet sequence-limit check does
+  // not re-enter while the DISCONNECT packet is itself being sent.
+  var _shutting_down: Bool = false
+  // Rekey (RFC 4253 §9). _rekey holds an in-progress re-exchange while the
+  // session stays Connected. From our KEXINIT until our NEWKEYS we may send
+  // only key-exchange traffic, so other outgoing packets are deferred in
+  // _pending_sends and flushed once our NEWKEYS is on the wire.
+  // _write_baseline/_read_baseline record the sequence number at which each
+  // direction's current key was installed, bounding how many packets (and thus
+  // nonces) a single key sees before the next rekey.
+  var _rekey: (SshRekeyContext | None) = None
+  var _send_blackout: Bool = false
+  let _pending_sends: Array[Array[U8] val] = Array[Array[U8] val]
+  var _write_baseline: U32 = 0
+  var _read_baseline: U32 = 0
 
   let _version_string: String val = "SSH-2.0-ponyssh_0.1"
 
@@ -77,6 +96,7 @@ actor SshSession
     end
     _kex = SshKexStateMachine(SshRoleClient)
     _auth = SshAuthStateMachine(config.username, config.auth_methods)
+    _remote_host = config.host
     _bridge = SshClientTcpBridge(auth, config.host, config.port, this)
 
   new create_server(config: SshServerConfig val, notify: SshServerNotify tag) =>
@@ -104,7 +124,7 @@ actor SshSession
     | let _: SshStateConnected =>
       let local_id = _channel_manager.open_channel(channel_type)
       _send_packet(SshChannelMessages.channel_open(channel_type, local_id,
-        0x200000, 0x8000))
+        SshChannelWindow.initial(), 0x8000))
     end
 
   be channel_send(channel_id: U32, data: Array[U8] val) =>
@@ -156,6 +176,14 @@ actor SshSession
     _state = SshStateDisconnected(None)
     _notify_disconnected()
 
+  be rekey() =>
+    """
+    Request a key re-exchange. A no-op unless the session is Connected and no
+    rekey is already in progress. The session also rekeys automatically as the
+    per-key packet count grows, so consumers rarely need this.
+    """
+    _start_rekey()
+
   be auth_accept() =>
     match _state
     | let _: SshStateAuth =>
@@ -189,7 +217,7 @@ actor SshSession
       match _channel_manager.get(channel_id)
       | let ch: SshChannelState =>
         _send_packet(SshChannelMessages.channel_open_confirmation(
-          ch.remote_id, ch.local_id, 0x200000, 0x8000))
+          ch.remote_id, ch.local_id, SshChannelWindow.initial(), 0x8000))
       end
     end
 
@@ -281,7 +309,11 @@ actor SshSession
 
     while true do
       match _reader.read()
-      | let payload: Array[U8] val => _dispatch_packet(payload)
+      | let payload: Array[U8] val =>
+        _dispatch_packet(payload)
+        // Bound per-key packet/nonce counts (rekey or, as a backstop, tear
+        // down) before the sequence number approaches the 2^32 nonce wrap.
+        if _check_packet_limits() then return end
       | let err: SshTransportError =>
         _disconnect_with_error(err)
         return
@@ -358,6 +390,26 @@ actor SshSession
       | SshMsgTypes.debug() => return     // silently discard
       | SshMsgTypes.unimplemented() => return  // peer couldn't handle something
       | SshMsgTypes.ext_info() => return  // extensions info, safe to ignore
+      end
+
+      // Rekey (RFC 4253 §9). Once connected, key-exchange traffic drives a
+      // re-exchange rather than the session state machine. A KEXINIT with no
+      // rekey yet in progress is the peer initiating one; we start ours and
+      // process theirs. Subsequent KEX messages route to the active rekey.
+      if _is_kex_message(msg_type) then
+        match _rekey
+        | let rk: SshRekeyContext => _handle_rekey(rk, msg_type, payload); return
+        | None =>
+          match _state
+          | let _: SshStateConnected =>
+            if msg_type == SshMsgTypes.kexinit() then
+              match _start_rekey()
+              | let rk: SshRekeyContext => _handle_rekey(rk, msg_type, payload)
+              end
+              return
+            end
+          end
+        end
       end
 
       // State-specific routing
@@ -593,7 +645,7 @@ actor SshSession
             s.awaiting_host_key_verification = true
             match _client_notify
             | let n: SshClientNotify tag =>
-              n.ssh_verify_host_key(this, "", host_key)
+              n.ssh_verify_host_key(this, _remote_host, host_key)
             end
           | let err: SshCryptoError =>
             _disconnect_with_error(SshKexFailed(err))
@@ -606,6 +658,277 @@ actor SshSession
       end
     else
       _disconnect_with_error(SshKexFailed(SshKeyInvalid))
+    end
+
+  fun _is_kex_message(msg_type: U8): Bool =>
+    (msg_type == SshMsgTypes.kexinit())
+      or (msg_type == SshMsgTypes.kex_ecdh_init())
+      or (msg_type == SshMsgTypes.kex_ecdh_reply())
+      or (msg_type == SshMsgTypes.newkeys())
+
+  fun ref _start_rekey(): (SshRekeyContext | None) =>
+    """
+    Begin a key re-exchange, or return the one already in progress. Sends our
+    KEXINIT and enters the send-blackout. Only meaningful once Connected.
+    """
+    match _rekey
+    | let r: SshRekeyContext => return r
+    end
+    match _state
+    | let _: SshStateConnected => None
+    else
+      return None
+    end
+    match _kex
+    | let kex: SshKexStateMachine =>
+      let ki =
+        try kex.generate_kexinit(_prefs)?
+        else
+          _disconnect_with_error(SshKexFailed(SshKeyInvalid))
+          return None
+        end
+      let rk = SshRekeyContext(ki)
+      _rekey = rk
+      // From our KEXINIT until our NEWKEYS we may send only key-exchange
+      // traffic (RFC 4253 §9); defer everything else until the blackout ends.
+      _send_blackout = true
+      _send_kex_packet(ki)
+      rk
+    else
+      None
+    end
+
+  fun ref _handle_rekey(rk: SshRekeyContext, msg_type: U8,
+    payload: Array[U8] val)
+  =>
+    """Route a key-exchange message belonging to an in-progress rekey."""
+    match msg_type
+    | SshMsgTypes.kexinit() =>
+      // Negotiate from the peer's KEXINIT and, as client, drive ECDH. A second
+      // KEXINIT is ignored.
+      match rk.their_kexinit
+      | None =>
+        match _kex
+        | let kex: SshKexStateMachine =>
+          match kex.receive_kexinit(payload, _prefs)
+          | let neg: SshNegotiatedAlgorithms val =>
+            rk.their_kexinit = payload
+            rk.negotiated = neg
+            match _role
+            | SshRoleClient =>
+              try
+                let ck = SshKexCurve25519.create()?
+                rk.our_kex = ck
+                _send_kex_packet(SshMessages.kex_ecdh_init(ck.public_key()))
+              else
+                _disconnect_with_error(SshKexFailed(SshKeyInvalid))
+              end
+            end
+          | let err: SshTransportError =>
+            _disconnect_with_error(err)
+          end
+        end
+      end
+    | SshMsgTypes.kex_ecdh_init() =>
+      match _role
+      | SshRoleServer => _rekey_server_ecdh(rk, payload)
+      end
+    | SshMsgTypes.kex_ecdh_reply() =>
+      match _role
+      | SshRoleClient => _rekey_client_ecdh(rk, payload)
+      end
+    | SshMsgTypes.newkeys() =>
+      _rekey_recv_newkeys(rk)
+    end
+
+  fun ref _rekey_server_ecdh(rk: SshRekeyContext, payload: Array[U8] val) =>
+    """
+    Server side of a rekey: derive the new shared secret and keys, sign the new
+    exchange hash (bound to the unchanged session id), and send KEX_ECDH_REPLY
+    followed by NEWKEYS.
+    """
+    (let neg: SshNegotiatedAlgorithms val, let their_ki: Array[U8] val) =
+      match (rk.negotiated, rk.their_kexinit)
+      | (let n: SshNegotiatedAlgorithms val, let tk: Array[U8] val) => (n, tk)
+      else
+        _disconnect_with_error(SshKexFailed(SshKeyInvalid))
+        return
+      end
+    let kex = match _kex
+      | let k: SshKexStateMachine => k
+      else _disconnect_with_error(SshKexFailed(SshKeyInvalid)); return
+      end
+    let session_id = match _context.session_id
+      | let id: Array[U8] val => id
+      else _disconnect_with_error(SshKexFailed(SshKeyInvalid)); return
+      end
+    try
+      let r = SshWireReader(payload)
+      r.read_byte()?  // msg type
+      let client_pub = r.read_string()?
+      let server_kex = SshKexCurve25519.create()?
+      let server_pub = server_kex.public_key()
+      match server_kex.derive_shared_secret(client_pub)
+      | let shared: Array[U8] val =>
+        match _host_key
+        | let hk: SshHostKeyPair =>
+          let pub_key = hk.public_key()
+          let host_key_blob = recover val
+            let w = SshWireWriter
+            w.write_string_from_str(pub_key.algorithm)
+            w.write_string(pub_key.public_key_data)
+            w.val_bytes()
+          end
+          let client_version = match _context.remote_version
+            | let v: String val => v else "" end
+          let exchange_hash = _compute_exchange_hash(client_version,
+            _version_string, their_ki, rk.our_kexinit, host_key_blob,
+            client_pub, server_pub, shared)?
+          // The session id never changes; the new keys bind to the original.
+          let keys = kex.derive_keys(shared, exchange_hash, session_id, neg)?
+          match hk.sign(exchange_hash)
+          | let raw_sig: Array[U8] val =>
+            let sig_blob = recover val
+              let w = SshWireWriter
+              w.write_string_from_str(pub_key.algorithm)
+              w.write_string(raw_sig)
+              w.val_bytes()
+            end
+            _send_kex_packet(SshMessages.kex_ecdh_reply(host_key_blob,
+              server_pub, sig_blob))
+            rk.derived = keys
+            _rekey_send_newkeys(rk)
+          | let err: SshCryptoError =>
+            _disconnect_with_error(SshKexFailed(err))
+          end
+        else
+          _disconnect_with_error(SshKexFailed(SshKeyInvalid))
+        end
+      | let err: SshCryptoError =>
+        _disconnect_with_error(SshKexFailed(err))
+      end
+    else
+      _disconnect_with_error(SshKexFailed(SshKeyInvalid))
+    end
+
+  fun ref _rekey_client_ecdh(rk: SshRekeyContext, payload: Array[U8] val) =>
+    """
+    Client side of a rekey: verify the server presents the same host key and a
+    valid signature over the new exchange hash, derive the new keys, and send
+    NEWKEYS. The consumer is not re-prompted — the key was approved already.
+    """
+    (let neg: SshNegotiatedAlgorithms val, let their_ki: Array[U8] val) =
+      match (rk.negotiated, rk.their_kexinit)
+      | (let n: SshNegotiatedAlgorithms val, let tk: Array[U8] val) => (n, tk)
+      else
+        _disconnect_with_error(SshKexFailed(SshKeyInvalid))
+        return
+      end
+    let client_kex = match rk.our_kex
+      | let k: SshKexCurve25519 => k
+      else _disconnect_with_error(SshKexFailed(SshKeyInvalid)); return
+      end
+    let kex = match _kex
+      | let k: SshKexStateMachine => k
+      else _disconnect_with_error(SshKexFailed(SshKeyInvalid)); return
+      end
+    let session_id = match _context.session_id
+      | let id: Array[U8] val => id
+      else _disconnect_with_error(SshKexFailed(SshKeyInvalid)); return
+      end
+    try
+      let r = SshWireReader(payload)
+      r.read_byte()?  // msg type
+      let host_key_blob = r.read_string()?
+      let server_pub = r.read_string()?
+      let signature = r.read_string()?
+      let client_pub = client_kex.public_key()
+      match client_kex.derive_shared_secret(server_pub)
+      | let shared: Array[U8] val =>
+        let server_version = match _context.remote_version
+          | let v: String val => v else "" end
+        let exchange_hash = _compute_exchange_hash(_version_string,
+          server_version, rk.our_kexinit, their_ki, host_key_blob, client_pub,
+          server_pub, shared)?
+        let kr = SshWireReader(host_key_blob)
+        let algo = kr.read_string_as_str()?
+        let pk_data = kr.read_string()?
+        let host_key = SshHostKey(algo, pk_data)
+        // The server must present the same host key it did at the initial
+        // exchange; a change at rekey would be a MITM swapping identities.
+        match _context.server_host_key
+        | let prev: SshHostKey val =>
+          if not _same_host_key(prev, host_key) then
+            _disconnect_with_error(SshKexFailed(SshKeyInvalid))
+            return
+          end
+        end
+        let sr = SshWireReader(signature)
+        sr.read_string_as_str()?  // signature algorithm
+        let raw_sig = sr.read_string()?
+        match SshHostKeyVerify.verify(host_key, raw_sig, exchange_hash)
+        | true =>
+          let keys = kex.derive_keys(shared, exchange_hash, session_id, neg)?
+          rk.derived = keys
+          _rekey_send_newkeys(rk)
+        | let err: SshCryptoError =>
+          _disconnect_with_error(SshKexFailed(err))
+        end
+      | let err: SshCryptoError =>
+        _disconnect_with_error(SshKexFailed(err))
+      end
+    else
+      _disconnect_with_error(SshKexFailed(SshKeyInvalid))
+    end
+
+  fun _same_host_key(a: SshHostKey val, b: SshHostKey val): Bool =>
+    if a.algorithm != b.algorithm then return false end
+    if a.public_key_data.size() != b.public_key_data.size() then return false end
+    var i: USize = 0
+    while i < a.public_key_data.size() do
+      if (try a.public_key_data(i)? else return false end)
+        != (try b.public_key_data(i)? else return false end)
+      then
+        return false
+      end
+      i = i + 1
+    end
+    true
+
+  fun ref _rekey_send_newkeys(rk: SshRekeyContext) =>
+    """
+    Send our NEWKEYS (under the old key), switch our outgoing direction to the
+    new key, and end the send-blackout — flushing any deferred packets.
+    """
+    _send_kex_packet(SshMessages.newkeys())
+    match (rk.derived, rk.negotiated)
+    | (let keys: SshDerivedKeys val, let neg: SshNegotiatedAlgorithms val) =>
+      if not _install_writer(keys, neg) then return end
+    else
+      _disconnect_with_error(SshKexFailed(SshKeyInvalid))
+      return
+    end
+    rk.sent_newkeys = true
+    _send_blackout = false
+    _flush_pending_sends()
+    _maybe_finish_rekey(rk)
+
+  fun ref _rekey_recv_newkeys(rk: SshRekeyContext) =>
+    """Peer NEWKEYS received: switch our incoming direction to the new key."""
+    match (rk.derived, rk.negotiated)
+    | (let keys: SshDerivedKeys val, let neg: SshNegotiatedAlgorithms val) =>
+      if not _install_reader(keys, neg) then return end
+    else
+      _disconnect_with_error(SshKexFailed(SshKeyInvalid))
+      return
+    end
+    rk.recv_newkeys = true
+    _maybe_finish_rekey(rk)
+
+  fun ref _maybe_finish_rekey(rk: SshRekeyContext) =>
+    """Once both directions have switched to the new keys, the rekey is done."""
+    if rk.sent_newkeys and rk.recv_newkeys then
+      _rekey = None
     end
 
   fun _compute_exchange_hash(
@@ -668,97 +991,153 @@ actor SshSession
         return false
       end
 
-    // c2s = client-to-server, s2c = server-to-client. The reader decrypts
-    // incoming packets, the writer encrypts outgoing ones.
-    (let write_key: Array[U8] val, let write_iv: Array[U8] val,
-     let read_key: Array[U8] val, let read_iv: Array[U8] val,
-     let write_mac_key: Array[U8] val, let read_mac_key: Array[U8] val) =
+    // Install both directions at once for the initial handshake (no encrypted
+    // data flows before NEWKEYS, so the directional timing is moot here). Rekey
+    // installs each direction separately at its own NEWKEYS boundary.
+    if not _install_writer(keys, s.negotiated) then return false end
+    if not _install_reader(keys, s.negotiated) then return false end
+
+    _encrypted = true
+    true
+
+  fun ref _install_writer(keys: SshDerivedKeys val,
+    neg: SshNegotiatedAlgorithms val): Bool
+  =>
+    """Configure the writer for our outgoing direction from derived key data."""
+    // The writer encrypts our outgoing direction: c2s for a client, s2c for a
+    // server. SSH negotiates the cipher/MAC for each direction independently.
+    (let cipher: String val, let mac: String val) =
       match _role
-      | SshRoleClient =>
-        (keys.enc_key_c2s, keys.iv_c2s, keys.enc_key_s2c, keys.iv_s2c,
-         keys.mac_key_c2s, keys.mac_key_s2c)
-      | SshRoleServer =>
-        (keys.enc_key_s2c, keys.iv_s2c, keys.enc_key_c2s, keys.iv_c2s,
-         keys.mac_key_s2c, keys.mac_key_c2s)
+      | SshRoleClient => (neg.cipher_c2s, neg.mac_c2s)
+      | SshRoleServer => (neg.cipher_s2c, neg.mac_s2c)
       end
+    (let key: Array[U8] val, let iv: Array[U8] val, let mac_key: Array[U8] val) =
+      match _role
+      | SshRoleClient => (keys.enc_key_c2s, keys.iv_c2s, keys.mac_key_c2s)
+      | SshRoleServer => (keys.enc_key_s2c, keys.iv_s2c, keys.mac_key_s2c)
+      end
+    if _install_write_cipher(cipher, mac, key, iv, mac_key) then
+      // Baseline the per-key packet count for this direction. For chacha the
+      // nonce is the sequence number, so this bounds how many nonces a single
+      // key sees before the next rekey.
+      _write_baseline = _writer.sequence_number()
+      true
+    else
+      false
+    end
 
-    let cipher_name = s.negotiated.cipher_c2s  // same for both directions
+  fun ref _install_reader(keys: SshDerivedKeys val,
+    neg: SshNegotiatedAlgorithms val): Bool
+  =>
+    """Configure the reader for the peer's incoming direction."""
+    (let cipher: String val, let mac: String val) =
+      match _role
+      | SshRoleClient => (neg.cipher_s2c, neg.mac_s2c)
+      | SshRoleServer => (neg.cipher_c2s, neg.mac_c2s)
+      end
+    (let key: Array[U8] val, let iv: Array[U8] val, let mac_key: Array[U8] val) =
+      match _role
+      | SshRoleClient => (keys.enc_key_s2c, keys.iv_s2c, keys.mac_key_s2c)
+      | SshRoleServer => (keys.enc_key_c2s, keys.iv_c2s, keys.mac_key_c2s)
+      end
+    if _install_read_cipher(cipher, mac, key, iv, mac_key) then
+      _read_baseline = _reader.sequence_number()
+      true
+    else
+      false
+    end
 
+  fun ref _install_write_cipher(cipher_name: String val, mac_name: String val,
+    key: Array[U8] val, iv: Array[U8] val, mac_key: Array[U8] val): Bool
+  =>
+    """
+    Configure the packet writer for our outgoing direction. Returns true once a
+    cipher is installed; on failure tears the connection down and returns false.
+    """
     if cipher_name == "chacha20-poly1305@openssh.com" then
-      // 64 bytes of key material per direction: main_key(32) || header_key(32).
-      // No separate IV or MAC key — poly1305 is the MAC, the nonce is the
-      // packet sequence number.
+      // 64 bytes of key material: main_key(32) || header_key(32). No separate
+      // IV or MAC key — poly1305 is the MAC, the nonce is the sequence number.
       try
-        let w_cc = SshChacha20Poly1305Context(_first_bytes(write_key, 64))?
-        let r_cc = SshChacha20Poly1305Context(_first_bytes(read_key, 64))?
-        _writer.set_chacha20_poly1305(w_cc)
-        _reader.set_chacha20_poly1305(r_cc)
+        _writer.set_chacha20_poly1305(
+          SshChacha20Poly1305Context(_first_bytes(key, 64))?)
+        true
       else
         _disconnect_with_error(SshKexFailed(SshKeyInvalid))
-        return false
+        false
       end
     elseif (cipher_name == "aes256-gcm@openssh.com")
       or (cipher_name == "aes128-gcm@openssh.com")
     then
-      // AEAD: per-packet GCM with 12-byte IV, last 8 bytes incremented
-      let write_iv_12 = recover val
-        let b = Array[U8].create(12)
-        var i: USize = 0
-        while i < 12 do try b.push(write_iv(i)?) end; i = i + 1 end
-        b
-      end
-      let read_iv_12 = recover val
-        let b = Array[U8].create(12)
-        var i: USize = 0
-        while i < 12 do try b.push(read_iv(i)?) end; i = i + 1 end
-        b
-      end
-      // Truncate key to cipher's key length (16 for aes128, 32 for aes256)
-      let key_len: USize = if cipher_name == "aes128-gcm@openssh.com"
-        then 16 else 32 end
-      let wk = _first_bytes(write_key, key_len)
-      let rk = _first_bytes(read_key, key_len)
-      _writer.set_gcm_params(wk, write_iv_12)
-      _reader.set_gcm_params(rk, read_iv_12)
+      let key_len: USize =
+        if cipher_name == "aes128-gcm@openssh.com" then 16 else 32 end
+      _writer.set_gcm_params(_first_bytes(key, key_len), _first_bytes(iv, 12))
+      true
     elseif (cipher_name == "aes256-ctr") or (cipher_name == "aes128-cbc") then
-      // Stream cipher: persistent context + HMAC.
-      // IV is first 16 bytes of derived IV (AES block size).
-      let write_iv_16 = _first_bytes(write_iv, 16)
-      let read_iv_16 = _first_bytes(read_iv, 16)
-
-      let mac_name = s.negotiated.mac_c2s
       let use_sha512 = mac_name == "hmac-sha2-512"
       let mac_len: USize = if use_sha512 then 64 else 32 end
-      // HMAC uses the whole key array, so slice to the exact MAC key length.
-      let w_mac = _first_bytes(write_mac_key, mac_len)
-      let r_mac = _first_bytes(read_mac_key, mac_len)
-
       try
-        let w_ctx = if cipher_name == "aes256-ctr" then
-          SshCipherContext.aes_256_ctr(write_key, write_iv_16, true)?
+        let ctx = if cipher_name == "aes256-ctr" then
+          SshCipherContext.aes_256_ctr(key, _first_bytes(iv, 16), true)?
         else
-          SshCipherContext.aes_128_cbc(write_key, write_iv_16, true)?
+          SshCipherContext.aes_128_cbc(key, _first_bytes(iv, 16), true)?
         end
-        let r_ctx = if cipher_name == "aes256-ctr" then
-          SshCipherContext.aes_256_ctr(read_key, read_iv_16, false)?
-        else
-          SshCipherContext.aes_128_cbc(read_key, read_iv_16, false)?
-        end
-        _writer.set_stream_cipher(w_ctx, w_mac, mac_len, use_sha512)
-        _reader.set_stream_cipher(r_ctx, r_mac, mac_len, 16, use_sha512)
+        _writer.set_stream_cipher(ctx, _first_bytes(mac_key, mac_len), mac_len,
+          use_sha512)
+        true
       else
         _disconnect_with_error(SshKexFailed(SshKeyInvalid))
-        return false
+        false
       end
     else
       // Negotiated a cipher the transport cannot apply. Fail closed rather
       // than fall through and send plaintext on a session marked encrypted.
       _disconnect_with_error(SshAlgorithmNegotiationFailed)
-      return false
+      false
     end
 
-    _encrypted = true
-    true
+  fun ref _install_read_cipher(cipher_name: String val, mac_name: String val,
+    key: Array[U8] val, iv: Array[U8] val, mac_key: Array[U8] val): Bool
+  =>
+    """
+    Configure the packet reader for the peer's incoming direction. Returns true
+    once a cipher is installed; on failure tears the connection down.
+    """
+    if cipher_name == "chacha20-poly1305@openssh.com" then
+      try
+        _reader.set_chacha20_poly1305(
+          SshChacha20Poly1305Context(_first_bytes(key, 64))?)
+        true
+      else
+        _disconnect_with_error(SshKexFailed(SshKeyInvalid))
+        false
+      end
+    elseif (cipher_name == "aes256-gcm@openssh.com")
+      or (cipher_name == "aes128-gcm@openssh.com")
+    then
+      let key_len: USize =
+        if cipher_name == "aes128-gcm@openssh.com" then 16 else 32 end
+      _reader.set_gcm_params(_first_bytes(key, key_len), _first_bytes(iv, 12))
+      true
+    elseif (cipher_name == "aes256-ctr") or (cipher_name == "aes128-cbc") then
+      let use_sha512 = mac_name == "hmac-sha2-512"
+      let mac_len: USize = if use_sha512 then 64 else 32 end
+      try
+        let ctx = if cipher_name == "aes256-ctr" then
+          SshCipherContext.aes_256_ctr(key, _first_bytes(iv, 16), false)?
+        else
+          SshCipherContext.aes_128_cbc(key, _first_bytes(iv, 16), false)?
+        end
+        _reader.set_stream_cipher(ctx, _first_bytes(mac_key, mac_len), mac_len,
+          16, use_sha512)
+        true
+      else
+        _disconnect_with_error(SshKexFailed(SshKeyInvalid))
+        false
+      end
+    else
+      _disconnect_with_error(SshAlgorithmNegotiationFailed)
+      false
+    end
 
   fun _first_bytes(src: Array[U8] val, n: USize): Array[U8] val =>
     """
@@ -937,6 +1316,8 @@ actor SshSession
         let sender_channel = r.read_u32()?
         let initial_window = r.read_u32()?
         let max_packet = r.read_u32()?
+        // recipient_channel must name a channel we actually opened.
+        if _channel_manager.get(recipient_channel) is None then error end
         _channel_manager.confirm_channel(recipient_channel, sender_channel,
           initial_window, max_packet)
         _notify_channel_opened(recipient_channel)
@@ -948,6 +1329,7 @@ actor SshSession
         let recipient_channel = r.read_u32()?
         let reason_code = r.read_u32()?
         let description = r.read_string_as_str()?
+        if _channel_manager.get(recipient_channel) is None then error end
         _channel_manager.close_channel(recipient_channel)
         _notify_channel_error(recipient_channel,
           SshChannelOpenFailed(reason_code, description))
@@ -958,16 +1340,36 @@ actor SshSession
         r.read_byte()?  // msg type
         let recipient_channel = r.read_u32()?
         let data = r.read_string()?
-        _channel_manager.channel_data_received(recipient_channel, data.size())
-        let transformed = match _channel_manager.get(recipient_channel)
-        | let ch: SshChannelState =>
-          match ch.pty
-          | let pty: SshPtyState val => pty.transform(data)
-          | None => data
+        // Drop data for a channel we never opened. recipient_channel is
+        // attacker-controlled; without this a peer can inject data on, and
+        // surface to the consumer, channel ids that never existed.
+        let ch = match _channel_manager.get(recipient_channel)
+          | let c: SshChannelState => c
+          | None => error
           end
-        | None => data
+        // Enforce the receive window we advertised. A peer that overruns it is
+        // violating flow control; close the channel rather than deliver
+        // unbounded data.
+        match _channel_manager.channel_data_received(recipient_channel,
+          data.size())
+        | let _: SshChannelError =>
+          _send_packet(SshChannelMessages.channel_close(ch.remote_id))
+          _channel_manager.close_channel(recipient_channel)
+          _notify_channel_error(recipient_channel, SshWindowExhausted)
+        | let _: U32 =>
+          let transformed = match ch.pty
+            | let pty: SshPtyState val => pty.transform(data)
+            | None => data
+            end
+          _notify_channel_data(recipient_channel, transformed)
+          // Replenish the receive window so the peer can keep sending; data
+          // handed to the consumer is treated as consumed.
+          match _channel_manager.replenish_local_window(recipient_channel)
+          | let inc: U32 =>
+            _send_packet(SshChannelMessages.channel_window_adjust(
+              ch.remote_id, inc))
+          end
         end
-        _notify_channel_data(recipient_channel, transformed)
       end
     | SshChannelMsgTypes.channel_window_adjust() =>
       try
@@ -984,6 +1386,7 @@ actor SshSession
         let r = SshWireReader(payload)
         r.read_byte()?  // msg type
         let recipient_channel = r.read_u32()?
+        if _channel_manager.get(recipient_channel) is None then error end
         _channel_manager.close_channel(recipient_channel)
         _notify_channel_closed(recipient_channel)
       end
@@ -994,6 +1397,7 @@ actor SshSession
         let recipient_channel = r.read_u32()?
         let request_type = r.read_string_as_str()?
         let want_reply = r.read_bool()?
+        if _channel_manager.get(recipient_channel) is None then error end
         match _server_notify
         | let n: SshServerNotify tag =>
           if request_type == "pty-req" then
@@ -1038,26 +1442,73 @@ actor SshSession
       end
     | SshChannelMsgTypes.channel_success() => None
     | SshChannelMsgTypes.channel_failure() => None
-    | SshMsgTypes.kexinit() =>
-      // A peer is initiating a mid-session rekey. We do not yet support
-      // rekeying; rather than silently corrupt the session (the old code
-      // re-ran key exchange and dropped back into authentication), tear the
-      // connection down cleanly. Long-lived sessions that need rekeying are a
-      // future feature.
-      _disconnect_with_error(SshRekeyUnsupported)
     | SshMsgTypes.disconnect() =>
       _state = SshStateDisconnected(SshConnectionLost)
       _notify_disconnected()
     end
 
   fun ref _send_packet(payload: Array[U8] val) =>
-    """Frame and send a packet."""
+    """
+    Frame and send a packet. While a rekey is in its send-blackout (from our
+    KEXINIT to our NEWKEYS) non-key-exchange packets are deferred so we emit
+    only key-exchange traffic, as RFC 4253 §9 requires.
+    """
+    if _send_blackout then
+      _pending_sends.push(payload)
+      return
+    end
+    _frame_and_send(payload)
+    _check_packet_limits()
+
+  fun ref _send_kex_packet(payload: Array[U8] val) =>
+    """Send a key-exchange/transport packet, bypassing the rekey send-blackout."""
+    _frame_and_send(payload)
+
+  fun ref _frame_and_send(payload: Array[U8] val) =>
     let block_size: USize = _current_block_size()
     let packet = _writer.write(payload, block_size)
     match _bridge
     | let b: SshClientTcpBridge tag => b.write(consume packet)
     | let b: SshServerTcpBridge tag => b.write(consume packet)
     end
+
+  fun ref _flush_pending_sends() =>
+    """Send packets deferred during the rekey send-blackout, in order."""
+    while _pending_sends.size() > 0 do
+      try _frame_and_send(_pending_sends.shift()?) end
+    end
+
+  fun _rekey_packet_limit(): U32 => 0x4000_0000  // 2^30: initiate rekey
+  fun _hard_packet_limit(): U32 => 0x7000_0000   // backstop, well under 2^31
+
+  fun _packets_since_rekey(): U32 =>
+    """
+    The larger of the two directions' packet counts since their current key was
+    installed. U32 subtraction is modular, so this stays correct across a
+    sequence-number wrap as long as the true distance is below 2^32 (it is — we
+    rekey every 2^30).
+    """
+    (_writer.sequence_number() - _write_baseline)
+      .max(_reader.sequence_number() - _read_baseline)
+
+  fun ref _check_packet_limits(): Bool =>
+    """
+    Keep each key's packet (and thus nonce) count bounded. Initiate a rekey at
+    2^30 packets so the session can continue indefinitely; as a backstop, if a
+    rekey never completes, fail closed well before the 2^32 nonce wrap. Returns
+    true once teardown has been initiated.
+    """
+    if _shutting_down then return false end
+    let since = _packets_since_rekey()
+    if since >= _hard_packet_limit() then
+      _shutting_down = true
+      _disconnect_with_error(SshRekeyUnsupported)
+      return true
+    end
+    if (since >= _rekey_packet_limit()) and (_rekey is None) then
+      _start_rekey()
+    end
+    false
 
   fun _current_block_size(): USize =>
     """Return cipher block size, or 8 for plaintext."""

@@ -54,6 +54,25 @@ class SshStateDisconnected
   new create(reason': (SshTransportError | None) = None) =>
     reason = reason'
 
+class SshRekeyContext
+  """
+  Tracks an in-progress key re-exchange (RFC 4253 §9) while the session stays
+  Connected. Unlike the initial key exchange this never sets the session id (it
+  is fixed at the first exchange hash) and returns to Connected — not Auth — at
+  completion. Each direction's new key is installed at its own NEWKEYS boundary,
+  tracked by sent_newkeys / recv_newkeys.
+  """
+  let our_kexinit: Array[U8] val
+  var their_kexinit: (Array[U8] val | None) = None
+  var negotiated: (SshNegotiatedAlgorithms val | None) = None
+  var our_kex: (SshKexCurve25519 | None) = None
+  var derived: (SshDerivedKeys val | None) = None
+  var sent_newkeys: Bool = false
+  var recv_newkeys: Bool = false
+
+  new create(our_kexinit': Array[U8] val) =>
+    our_kexinit = our_kexinit'
+
 class SshSessionContext
   """Accumulates connection-lifetime facts."""
   var remote_addr: String val = ""

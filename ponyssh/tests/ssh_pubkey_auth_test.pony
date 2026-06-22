@@ -93,16 +93,24 @@ actor _PubkeyServerNotify is SshServerNotify
   let _authorized_key: Array[U8] val = _TestPubkeyAuthorized()
   var _listener: (SshListener tag | None) = None
 
-  // stubbies
-  fun get_pty(): SshPtyState val => SshPtyState.none()
-  fun ref set_pty(x: SshPtyState val) => None
-  // nomorestubbies
-
   new create(h: TestHelper) =>
     _h = h
 
   be set_listener(listener: SshListener tag) =>
     _listener = listener
+
+  fun validate_password(username: String val, password: String val): Bool =>
+    false
+
+  fun validate_publickey(username: String val,
+    pk: SshAuthPublicKeyData val): Bool
+  =>
+    pk.matches(_authorized_key)
+
+  be ssh_channel_open_request(session: SshSession tag, channel_id: U32,
+    channel_type: String val)
+  =>
+    session.accept_channel(channel_id)
 
   be ssh_session_started(session: SshSession tag) =>
     // Only one connection is expected; stop listening immediately so a failed
@@ -112,66 +120,6 @@ actor _PubkeyServerNotify is SshServerNotify
     | let l: SshListener tag =>
       l.dispose()
       _listener = None
-    end
-
-  be ssh_auth_request(session: SshSession tag, request: SshAuthRequest val) =>
-    match request.method_data
-    | let pk: SshAuthPublicKeyData val =>
-      // Check key matches authorized key
-      if not SshMac.verify(pk.public_key, _authorized_key) then
-        _h.fail("Server received unknown public key")
-        let remaining = recover val
-          let a = Array[String val]
-          a.push("publickey")
-          a
-        end
-        session.auth_reject(remaining)
-        return
-      end
-      match pk.signature
-      | None =>
-        // Query — accept this key
-        session.auth_pk_ok(pk.algorithm, pk.public_key)
-      | let _: Array[U8] val =>
-        // Actual auth with signature — accept
-        session.auth_accept()
-      end
-    else
-      let remaining = recover val
-        let a = Array[String val]
-        a.push("publickey")
-        a
-      end
-      session.auth_reject(remaining)
-    end
-
-  be ssh_session_ready(session: SshSession tag) => None
-
-  be ssh_channel_open_request(session: SshSession tag, channel_id: U32,
-    channel_type: String val)
-  =>
-    session.accept_channel(channel_id)
-
-  be ssh_pty_request(session: SshSession tag, channel_id: U32,
-    pty: SshPtyState val, want_reply: Bool)
-  =>
-    if want_reply then session.accept_request(channel_id) end
-
-  be ssh_shell_request(session: SshSession tag, channel_id: U32,
-    want_reply: Bool)
-  =>
-    if want_reply then session.accept_request(channel_id) end
-
-  be ssh_window_change(session: SshSession tag, channel_id: U32,
-    width_chars: U32, height_rows: U32, width_pixels: U32, height_pixels: U32)
-  =>
-    None
-
-  be ssh_channel_request(session: SshSession tag, channel_id: U32,
-    request_type: String val, want_reply: Bool)
-  =>
-    if want_reply then
-      session.accept_request(channel_id)
     end
 
   be ssh_channel_data(session: SshSession tag, channel_id: U32,
@@ -184,13 +132,6 @@ actor _PubkeyServerNotify is SshServerNotify
       end
     end
 
-  be ssh_channel_error(session: SshSession tag, channel_id: U32,
-    err: SshChannelError val) => None
-
-  be ssh_channel_closed(session: SshSession tag, channel_id: U32) => None
-
   be ssh_error(session: SshSession tag, err: SshTransportError val) =>
     _h.fail("Server error: " + err.string())
     _h.complete(true)
-
-  be ssh_disconnected(session: SshSession tag) => None

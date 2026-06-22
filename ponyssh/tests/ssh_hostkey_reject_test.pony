@@ -33,7 +33,7 @@ class iso _TestIntegrationHostKeyReject is UnitTest
 
     let client_config = SshClientConfig("127.0.0.1", "19829",
       "testuser",
-      recover val [as SshAuthMethod val: SshNoneAuth] end)
+      recover val [as SshAuthMethod val: SshPasswordAuth("testpw")] end)
     let connect_auth = TCPConnectAuth(h.env.root)
     SshConnector.connect(connect_auth, client_config,
       _RejectHostKeyClientNotify(h))
@@ -75,14 +75,20 @@ actor _RejectHostKeyServerNotify is SshServerNotify
   let _h: TestHelper
   var _listener: (SshListener tag | None) = None
 
-  fun get_pty(): SshPtyState val => SshPtyState.none()
-  fun ref set_pty(x: SshPtyState val) => None
-
   new create(h: TestHelper) =>
     _h = h
 
   be set_listener(listener: SshListener tag) =>
     _listener = listener
+
+  // Accept any credential. This is only ever consulted if the client proceeded
+  // to auth — which means the host-key gate failed. Accepting makes the
+  // client's ssh_ready fire so the test fails loudly.
+  fun validate_password(username: String val, password: String val): Bool =>
+    true
+
+  fun validate_publickey(username: String val,
+    pk: SshAuthPublicKeyData val): Bool => true
 
   be ssh_session_started(session: SshSession tag) =>
     // Only one connection is expected; stop listening so the runtime can
@@ -92,8 +98,3 @@ actor _RejectHostKeyServerNotify is SshServerNotify
       l.dispose()
       _listener = None
     end
-
-  be ssh_auth_request(session: SshSession tag, request: SshAuthRequest val) =>
-    // Reached only if the client proceeded to auth — which means the host-key
-    // gate failed. Accept so the client's ssh_ready fires and the test fails.
-    session.auth_accept()
