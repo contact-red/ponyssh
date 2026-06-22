@@ -9,7 +9,10 @@ class iso _TestKexGenerateKexinit is UnitTest
   fun apply(h: TestHelper) =>
     let prefs = SshDefaultAlgorithms.preferences()
     let kex = SshKexStateMachine(SshRoleClient)
-    let payload = kex.generate_kexinit(prefs)
+    let payload =
+      try kex.generate_kexinit(prefs)?
+      else h.fail("generate_kexinit failed"); return
+      end
 
     // Decode and verify fields match original prefs
     let decoded =
@@ -56,7 +59,10 @@ class iso _TestKexReceiveAndNegotiate is UnitTest
 
     // Client generates KEXINIT
     let client_kex = SshKexStateMachine(SshRoleClient)
-    let client_payload = client_kex.generate_kexinit(prefs)
+    let client_payload =
+      try client_kex.generate_kexinit(prefs)?
+      else h.fail("generate_kexinit failed"); return
+      end
 
     // Server receives it and negotiates
     let server_kex = SshKexStateMachine(SshRoleServer)
@@ -102,16 +108,21 @@ class iso _TestKexDeriveKeys is UnitTest
       "hmac-sha2-256", "hmac-sha2-256")
 
     let kex = SshKexStateMachine(SshRoleClient)
-    let keys = kex.derive_keys(shared_secret, exchange_hash, session_id,
-      negotiated)
+    let keys =
+      try
+        kex.derive_keys(shared_secret, exchange_hash, session_id, negotiated)?
+      else h.fail("derive_keys failed"); return
+      end
 
-    // All 6 keys should be 32 bytes (SHA-256 output)
+    // IVs are one SHA-256 round (32 bytes); encryption and MAC keys are
+    // derived to 64 bytes via the RFC 4253 section 7.2 extension so they can
+    // key chacha20-poly1305 (64) and HMAC-SHA-512 (64).
     h.assert_eq[USize](keys.iv_c2s.size(), 32, "iv_c2s size")
     h.assert_eq[USize](keys.iv_s2c.size(), 32, "iv_s2c size")
-    h.assert_eq[USize](keys.enc_key_c2s.size(), 32, "enc_key_c2s size")
-    h.assert_eq[USize](keys.enc_key_s2c.size(), 32, "enc_key_s2c size")
-    h.assert_eq[USize](keys.mac_key_c2s.size(), 32, "mac_key_c2s size")
-    h.assert_eq[USize](keys.mac_key_s2c.size(), 32, "mac_key_s2c size")
+    h.assert_eq[USize](keys.enc_key_c2s.size(), 64, "enc_key_c2s size")
+    h.assert_eq[USize](keys.enc_key_s2c.size(), 64, "enc_key_s2c size")
+    h.assert_eq[USize](keys.mac_key_c2s.size(), 64, "mac_key_c2s size")
+    h.assert_eq[USize](keys.mac_key_s2c.size(), 64, "mac_key_s2c size")
 
     // Different letters should produce different keys
     h.assert_false(_arrays_eq(keys.iv_c2s, keys.iv_s2c),
@@ -125,8 +136,11 @@ class iso _TestKexDeriveKeys is UnitTest
 
     // Same inputs produce same outputs (deterministic)
     let kex2 = SshKexStateMachine(SshRoleClient)
-    let keys2 = kex2.derive_keys(shared_secret, exchange_hash, session_id,
-      negotiated)
+    let keys2 =
+      try
+        kex2.derive_keys(shared_secret, exchange_hash, session_id, negotiated)?
+      else h.fail("derive_keys failed"); return
+      end
     h.assert_true(_arrays_eq(keys.iv_c2s, keys2.iv_c2s),
       "deterministic: iv_c2s")
     h.assert_true(_arrays_eq(keys.enc_key_c2s, keys2.enc_key_c2s),

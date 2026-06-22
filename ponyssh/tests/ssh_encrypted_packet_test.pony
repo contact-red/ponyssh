@@ -7,8 +7,8 @@ class iso _TestEncryptedPacketRoundtrip is UnitTest
   fun name(): String => "ssh_transport/packet/encrypted_roundtrip"
 
   fun apply(h: TestHelper) =>
-    let key: Array[U8] val = SshRandom.random_bytes(32)
-    let iv: Array[U8] val = SshRandom.random_bytes(12)
+    let key: Array[U8] val = _TestBytes(32)
+    let iv: Array[U8] val = _TestBytes(12)
     let payload: Array[U8] val = recover val [as U8: 1; 2; 3; 4; 5] end
 
     // Encrypt
@@ -42,8 +42,8 @@ class iso _TestEncryptedPacketCorrupted is UnitTest
   fun name(): String => "ssh_transport/packet/encrypted_corrupted"
 
   fun apply(h: TestHelper) =>
-    let key: Array[U8] val = SshRandom.random_bytes(32)
-    let iv: Array[U8] val = SshRandom.random_bytes(12)
+    let key: Array[U8] val = _TestBytes(32)
+    let iv: Array[U8] val = _TestBytes(12)
     let payload: Array[U8] val = recover val [as U8: 10; 20; 30; 40; 50] end
 
     // Encrypt
@@ -85,10 +85,10 @@ class iso _TestEncryptedPacketLargePayload is UnitTest
   fun name(): String => "ssh_transport/packet/encrypted_large_payload"
 
   fun apply(h: TestHelper) =>
-    let key: Array[U8] val = SshRandom.random_bytes(32)
-    let iv: Array[U8] val = SshRandom.random_bytes(12)
+    let key: Array[U8] val = _TestBytes(32)
+    let iv: Array[U8] val = _TestBytes(12)
     // 1000-byte payload to exercise larger packets
-    let payload: Array[U8] val = SshRandom.random_bytes(1000)
+    let payload: Array[U8] val = _TestBytes(1000)
 
     var enc_ctx: SshCipherContext ref =
       try SshCipherContext.aes_256_gcm(key, iv, true)?

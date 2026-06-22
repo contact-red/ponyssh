@@ -7,7 +7,7 @@ class iso _TestChacha20Poly1305Roundtrip is UnitTest
 
   fun apply(h: TestHelper) =>
     // 64-byte key: main_key (0-31) || header_key (32-63)
-    let key: Array[U8] val = SshRandom.random_bytes(64)
+    let key: Array[U8] val = _TestBytes(64)
 
     // Build a plaintext SSH packet:
     // packet_length (4 bytes) || padding_length (1 byte) || payload || padding
@@ -63,7 +63,7 @@ class iso _TestChacha20Poly1305SequenceNumberMatters is UnitTest
   fun name(): String => "ssh_crypto/chacha20poly1305/sequence_number_matters"
 
   fun apply(h: TestHelper) =>
-    let key: Array[U8] val = SshRandom.random_bytes(64)
+    let key: Array[U8] val = _TestBytes(64)
 
     let plaintext: Array[U8] val = recover val
       let p = Array[U8].create(20)
@@ -107,7 +107,7 @@ class iso _TestChacha20Poly1305Corrupted is UnitTest
   fun name(): String => "ssh_crypto/chacha20poly1305/corrupted"
 
   fun apply(h: TestHelper) =>
-    let key: Array[U8] val = SshRandom.random_bytes(64)
+    let key: Array[U8] val = _TestBytes(64)
 
     let plaintext: Array[U8] val = recover val
       let p = Array[U8].create(20)

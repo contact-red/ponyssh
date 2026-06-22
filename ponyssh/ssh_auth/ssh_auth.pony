@@ -149,3 +149,65 @@ class SshAuthStateMachine
     w.write_string_from_str(pub_key.algorithm)
     w.write_string(pub_key.public_key_data)
     w.val_bytes()
+
+primitive SshPublicKeyVerifier
+  """
+  Server-side verification of a client publickey userauth signature per
+  RFC 4252 section 7. This proves the client holds the private key for the
+  presented public key; the consumer still decides whether that key is
+  authorized.
+  """
+  fun verify(session_id: Array[U8] val, username: String val,
+    service: String val, pk: SshAuthPublicKeyData val): Bool
+  =>
+    """
+    Returns true only when pk.signature is a valid signature over the expected
+    signed data — string(session_id) || byte(SSH_MSG_USERAUTH_REQUEST) ||
+    string(username) || string(service) || string("publickey") || bool(true) ||
+    string(algorithm) || string(public_key_blob) — proving possession of the
+    private key. Only ssh-ed25519 keys are supported; every other algorithm,
+    and any malformed blob, fails closed.
+    """
+    let signature_blob = match pk.signature
+    | let s: Array[U8] val => s
+    else
+      return false
+    end
+
+    try
+      // signature blob: string(algorithm) || string(raw_signature)
+      let sr = SshWireReader(signature_blob)
+      let sig_algo = sr.read_string_as_str()?
+      let raw_sig = sr.read_string()?
+
+      // public key blob: string(algorithm) || string(raw_key)
+      let kr = SshWireReader(pk.public_key)
+      let key_algo = kr.read_string_as_str()?
+      let raw_key = kr.read_string()?
+
+      // The advertised, key-blob and signature algorithms must all agree.
+      if (pk.algorithm != key_algo) or (sig_algo != key_algo) then
+        return false
+      end
+
+      // Reconstruct the signed data exactly as the client built it
+      // (SshAuthStateMachine.handle_pk_ok).
+      let w = SshWireWriter
+      w.write_string(session_id)
+      w.write_byte(SshAuthMsgTypes.userauth_request())
+      w.write_string_from_str(username)
+      w.write_string_from_str(service)
+      w.write_string_from_str("publickey")
+      w.write_bool(true)
+      w.write_string_from_str(key_algo)
+      w.write_string(pk.public_key)
+      let signed = w.val_bytes()
+
+      match SshHostKeyVerify.verify(SshHostKey(key_algo, raw_key), raw_sig,
+        signed)
+      | true => true
+      else false
+      end
+    else
+      false
+    end

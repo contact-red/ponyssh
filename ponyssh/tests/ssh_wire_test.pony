@@ -72,7 +72,7 @@ class iso _TestKexinitRoundtrip is UnitTest
 
   fun apply(h: TestHelper) =>
     let prefs = SshDefaultAlgorithms.preferences()
-    let cookie: Array[U8] val = SshRandom.random_bytes(16)
+    let cookie: Array[U8] val = _TestBytes(16)
     let encoded = SshMessages.kexinit(prefs, cookie)
 
     let decoded =

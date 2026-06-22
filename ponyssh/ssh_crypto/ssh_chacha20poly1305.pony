@@ -74,13 +74,19 @@ class SshChacha20Poly1305Context
       // Step 1: Encrypt packet_length with header_key (ChaCha20-Poly1305, ignore tag)
       let header_ctx = SshCipherContext.chacha20_poly1305_raw(
         _header_key, nonce, true)?
-      let encrypted_header = header_ctx.encrypt(pkt_len_bytes)
+      let encrypted_header = match header_ctx.encrypt(pkt_len_bytes)
+        | let e: Array[U8] val => e
+        | let err: SshCryptoError => return err
+        end
 
       // Step 2: Encrypt body with main_key, using encrypted_header as AAD
       let body_ctx = SshCipherContext.chacha20_poly1305_raw(
         _main_key, nonce, true)?
       body_ctx.set_aad(encrypted_header)?
-      let encrypted_body = body_ctx.encrypt(body, true)
+      let encrypted_body = match body_ctx.encrypt(body, true)
+        | let e: Array[U8] val => e
+        | let err: SshCryptoError => return err
+        end
       let poly_tag = body_ctx.tag_value()
 
       // Assemble: encrypted_header || encrypted_body || poly_tag
@@ -174,6 +180,33 @@ class SshChacha20Poly1305Context
         end
         result
       | let err: SshCryptoError => err
+      end
+    else
+      SshDecryptFailed
+    end
+
+  fun ref decrypt_length(sequence_number: U32, enc_header: Array[U8] val):
+    (U32 | SshCryptoError)
+  =>
+    """
+    Decrypt only the 4-byte encrypted packet-length field, so a reader can
+    learn how many more bytes to wait for before the full frame is buffered.
+    The length is encrypted with header_key as a pure stream (no tag).
+    """
+    if enc_header.size() < 4 then return SshDecryptFailed end
+    let nonce = _make_nonce(sequence_number)
+    try
+      let header_ctx = SshCipherContext.chacha20_poly1305_raw(
+        _header_key, nonce, false)?
+      let dec_header = match header_ctx.decrypt(enc_header)
+      | let d: Array[U8] val => d
+      | let err: SshCryptoError => return err
+      end
+      try
+        (dec_header(0)?.u32() << 24) or (dec_header(1)?.u32() << 16) or
+        (dec_header(2)?.u32() << 8) or dec_header(3)?.u32()
+      else
+        SshDecryptFailed
       end
     else
       SshDecryptFailed

@@ -1,6 +1,9 @@
 primitive SshDecryptFailed is Stringable
   fun string(): String iso^ => "decryption failed".clone()
 
+primitive SshEncryptFailed is Stringable
+  fun string(): String iso^ => "encryption failed".clone()
+
 primitive SshMacMismatch is Stringable
   fun string(): String iso^ => "MAC mismatch".clone()
 
@@ -21,6 +24,7 @@ class val SshOpenSSLError is Stringable
 
 type SshCryptoError is
   ( SshDecryptFailed
+  | SshEncryptFailed
   | SshMacMismatch
   | SshSignatureInvalid
   | SshKeyInvalid
@@ -47,13 +51,17 @@ primitive SshProtocolVersionMismatch is Stringable
 primitive SshConnectionLost is Stringable
   fun string(): String iso^ => "connection lost".clone()
 
+primitive SshRekeyUnsupported is Stringable
+  fun string(): String iso^ => "rekeying is not supported".clone()
+
 type SshTransportError is
   ( SshPacketTooLarge
   | SshPacketCorrupt
   | SshKexFailed
   | SshAlgorithmNegotiationFailed
   | SshProtocolVersionMismatch
-  | SshConnectionLost )
+  | SshConnectionLost
+  | SshRekeyUnsupported )
 
 primitive SshAuthRejected is Stringable
   fun string(): String iso^ => "authentication rejected".clone()

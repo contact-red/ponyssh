@@ -12,12 +12,15 @@ class iso _TestCipherRoundtrip is UnitTest
     end
     PonyCheck.for_all[Array[U8] iso](gen, h)(
       {(plaintext: Array[U8] iso, ph: PropertyHelper) ? =>
-        let key: Array[U8] val = SshRandom.random_bytes(32)
-        let iv: Array[U8] val = SshRandom.random_bytes(12)
+        let key: Array[U8] val = _TestBytes(32)
+        let iv: Array[U8] val = _TestBytes(12)
         let pt: Array[U8] val = consume plaintext
 
         var enc_ctx = SshCipherContext.aes_256_gcm(key, iv, true)?
-        let ciphertext = enc_ctx.encrypt(pt, true)
+        let ciphertext = match enc_ctx.encrypt(pt, true)
+          | let c: Array[U8] val => c
+          | let e: SshCryptoError => ph.fail("encrypt failed: " + e.string()); error
+          end
         let gcm_tag = match enc_ctx.tag_value()
         | let t: Array[U8] val => t
         | None => error
@@ -38,8 +41,8 @@ class iso _TestCipherDecryptCorrupted is UnitTest
   fun name(): String => "ssh_crypto/cipher/aes_256_gcm_corrupted"
 
   fun apply(h: TestHelper) =>
-    let key: Array[U8] val = SshRandom.random_bytes(32)
-    let iv: Array[U8] val = SshRandom.random_bytes(12)
+    let key: Array[U8] val = _TestBytes(32)
+    let iv: Array[U8] val = _TestBytes(12)
     let plaintext: Array[U8] val = "hello ssh cipher test".array()
 
     let enc_ctx =
@@ -47,7 +50,10 @@ class iso _TestCipherDecryptCorrupted is UnitTest
       else h.fail("failed to create encrypt context"); return
       end
     var mutable_enc = enc_ctx
-    let ciphertext = mutable_enc.encrypt(plaintext, true)
+    let ciphertext = match mutable_enc.encrypt(plaintext, true)
+      | let c: Array[U8] val => c
+      | let e: SshCryptoError => h.fail("encrypt failed: " + e.string()); return
+      end
     let gcm_tag = match mutable_enc.tag_value()
     | let t: Array[U8] val => t
     | None => h.fail("no tag after encrypt"); return

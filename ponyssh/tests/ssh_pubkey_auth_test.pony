@@ -35,7 +35,10 @@ class iso _TestIntegrationPubkeyAuth is UnitTest
     h.long_test(10_000_000_000)
 
     let server_pem = _TestEd25519Pem()  // host key
-    let server_config = SshServerConfig(server_pem, "127.0.0.1", "19828")
+    let server_config =
+      try SshServerConfig(server_pem, "127.0.0.1", "19828")?
+      else h.fail("invalid host key"); return
+      end
 
     let server_notify = _PubkeyServerNotify(h)
     let listen_auth = TCPListenAuth(h.env.root)
@@ -101,7 +104,15 @@ actor _PubkeyServerNotify is SshServerNotify
   be set_listener(listener: SshListener tag) =>
     _listener = listener
 
-  be ssh_session_started(session: SshSession tag) => None
+  be ssh_session_started(session: SshSession tag) =>
+    // Only one connection is expected; stop listening immediately so a failed
+    // auth exchange can never leave a listener bound to the port (a leaked
+    // listener would block — and silently mis-route — later test runs).
+    match _listener
+    | let l: SshListener tag =>
+      l.dispose()
+      _listener = None
+    end
 
   be ssh_auth_request(session: SshSession tag, request: SshAuthRequest val) =>
     match request.method_data

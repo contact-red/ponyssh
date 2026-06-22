@@ -200,27 +200,32 @@ class ref SshCipherContext
     end
     if rc != 1 then error end
 
-  fun ref encrypt(plaintext: Array[U8] val, is_aead: Bool = true): Array[U8] val =>
+  fun ref encrypt(plaintext: Array[U8] val, is_aead: Bool = true):
+    (Array[U8] val | SshCryptoError)
+  =>
     let out_size = plaintext.size() + 16
     let out = recover iso Array[U8].init(0, out_size) end
     var out_len: I32 = 0
-    @EVP_EncryptUpdate(
-      _ctx,
-      out.cpointer(),
-      addressof out_len,
-      plaintext.cpointer(),
-      plaintext.size().i32())
+    if @EVP_EncryptUpdate(_ctx, out.cpointer(), addressof out_len,
+      plaintext.cpointer(), plaintext.size().i32()) != 1
+    then
+      return SshEncryptFailed
+    end
     var final_len: I32 = 0
-    @EVP_EncryptFinal_ex(_ctx, out.cpointer(out_len.usize()), addressof final_len)
+    if @EVP_EncryptFinal_ex(_ctx, out.cpointer(out_len.usize()),
+      addressof final_len) != 1
+    then
+      return SshEncryptFailed
+    end
     let total = (out_len + final_len).usize()
     out.truncate(total)
     if is_aead then
       let tag_buf = recover iso Array[U8].init(0, 16) end
-      @EVP_CIPHER_CTX_ctrl(
-        _ctx,
-        _EvpCtrlGcmGetTag(),
-        16,
-        tag_buf.cpointer())
+      if @EVP_CIPHER_CTX_ctrl(_ctx, _EvpCtrlGcmGetTag(), 16,
+        tag_buf.cpointer()) != 1
+      then
+        return SshEncryptFailed
+      end
       _tag = consume tag_buf
     end
     consume out
@@ -258,35 +263,37 @@ class ref SshCipherContext
     out.truncate(total)
     consume out
 
-  fun ref encrypt_stream(plaintext: Array[U8] val): Array[U8] val =>
+  fun ref encrypt_stream(plaintext: Array[U8] val):
+    (Array[U8] val | SshCryptoError)
+  =>
     """
     Streaming encrypt (Update only, no Final). For CTR/CBC where the cipher
     context persists across packets.
     """
     let out = recover iso Array[U8].init(0, plaintext.size() + 16) end
     var out_len: I32 = 0
-    @EVP_EncryptUpdate(
-      _ctx,
-      out.cpointer(),
-      addressof out_len,
-      plaintext.cpointer(),
-      plaintext.size().i32())
+    if @EVP_EncryptUpdate(_ctx, out.cpointer(), addressof out_len,
+      plaintext.cpointer(), plaintext.size().i32()) != 1
+    then
+      return SshEncryptFailed
+    end
     out.truncate(out_len.usize())
     consume out
 
-  fun ref decrypt_stream(ciphertext: Array[U8] val): Array[U8] val =>
+  fun ref decrypt_stream(ciphertext: Array[U8] val):
+    (Array[U8] val | SshCryptoError)
+  =>
     """
     Streaming decrypt (Update only, no Final). For CTR/CBC where the cipher
     context persists across packets.
     """
     let out = recover iso Array[U8].init(0, ciphertext.size() + 16) end
     var out_len: I32 = 0
-    @EVP_DecryptUpdate(
-      _ctx,
-      out.cpointer(),
-      addressof out_len,
-      ciphertext.cpointer(),
-      ciphertext.size().i32())
+    if @EVP_DecryptUpdate(_ctx, out.cpointer(), addressof out_len,
+      ciphertext.cpointer(), ciphertext.size().i32()) != 1
+    then
+      return SshDecryptFailed
+    end
     out.truncate(out_len.usize())
     consume out
 

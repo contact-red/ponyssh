@@ -42,3 +42,20 @@ class iso _TestKexCurve25519InvalidKey is UnitTest
     | let _: SshCryptoError =>
       h.assert_true(true)
     end
+
+class iso _TestKexCurve25519WrongLengthKey is UnitTest
+  """
+  X25519 peer keys must be exactly 32 bytes; a 33-byte key (one byte too long)
+  must be rejected by the explicit length check before reaching OpenSSL.
+  """
+  fun name(): String => "ssh_crypto/kex/curve25519_wrong_length_key"
+
+  fun apply(h: TestHelper) ? =>
+    let alice = SshKexCurve25519.create()?
+    let too_long: Array[U8] val = recover val Array[U8].init(7, 33) end
+    match alice.derive_shared_secret(too_long)
+    | let _: Array[U8] val =>
+      h.fail("a 33-byte peer key must be rejected")
+    | let _: SshCryptoError =>
+      h.assert_true(true)
+    end

@@ -13,12 +13,22 @@ class SshPacketWriter
   var _mac_key: (Array[U8] val | None) = None
   var _mac_len: USize = 0
   var _use_sha512: Bool = false
+  // chacha20-poly1305@openssh.com: integrated cipher + MAC keyed by sequence
+  var _chacha: (SshChacha20Poly1305Context | None) = None
   // Legacy single-shot context (for tests)
   var _encrypt_ctx: (SshCipherContext | None) = None
 
   fun ref set_encrypt_ctx(ctx: SshCipherContext, is_aead: Bool = true) =>
     _encrypt_ctx = ctx
     _is_aead = is_aead
+
+  fun ref set_chacha20_poly1305(ctx: SshChacha20Poly1305Context) =>
+    """
+    Set up chacha20-poly1305@openssh.com encryption. The context carries both
+    keys; the packet sequence number is the nonce. There is no separate IV or
+    MAC key. Packets align packet_length to an 8-byte boundary.
+    """
+    _chacha = ctx
 
   fun ref set_gcm_params(key: Array[U8] val, iv: Array[U8] val) =>
     """
@@ -50,6 +60,7 @@ class SshPacketWriter
     _gcm_iv = None
     _stream_ctx = None
     _mac_key = None
+    _chacha = None
 
   fun ref write(payload: Array[U8] val, block_size: USize = 8): Array[U8] iso^ =>
     """
@@ -65,7 +76,19 @@ class SshPacketWriter
     //   because the packet_length field is encrypted along with the body
     // - AEAD (GCM): packet_length itself must be multiple of block_size
     //   because the 4-byte length is plaintext AAD, not part of the encrypted block
-    let actual_padding = if _is_aead then
+    let chacha_active =
+      match _chacha
+      | let _: SshChacha20Poly1305Context => true
+      else false
+      end
+
+    let actual_padding = if chacha_active then
+      // chacha20-poly1305: the 4-byte length is encrypted separately, so the
+      // padded packet_length itself must be a multiple of the 8-byte block.
+      let min_pkt_len = 1 + payload.size() + 4
+      let rem = min_pkt_len % 8
+      if rem == 0 then USize(4) else 4 + (8 - rem) end
+    elseif _is_aead then
       // AEAD: align packet_length to block_size
       let min_pkt_len = 1 + payload.size() + 4  // with minimum 4 padding
       let rem = min_pkt_len % block_size
@@ -80,12 +103,20 @@ class SshPacketWriter
 
     let packet_length = (1 + payload.size() + actual_padding).u32()
 
+    let pad =
+      try
+        SshRandom.random_bytes(actual_padding)?
+      else
+        // CSPRNG failure: emit nothing rather than weak/zero padding. The peer
+        // fails to parse the truncated stream and the session tears down.
+        return recover iso Array[U8] end
+      end
+
     let result = recover iso
       let w = Writer
       w.u32_be(packet_length)
       w.u8(actual_padding.u8())
       w.write(payload)
-      let pad = SshRandom.random_bytes(actual_padding)
       w.write(consume pad)
       let chunks = w.done()
       let buf = Array[U8].create(4 + packet_length.usize())
@@ -99,6 +130,22 @@ class SshPacketWriter
     end
 
     _sequence_number = _sequence_number + 1
+
+    // chacha20-poly1305: encrypt the entire framed packet; the nonce is this
+    // packet's sequence number (the value before the increment above).
+    match _chacha
+    | let cc: SshChacha20Poly1305Context =>
+      let plaintext: Array[U8] val = consume result
+      // On FFI failure, fall back to an empty frame rather than leaking the
+      // plaintext packet; the peer then fails to authenticate and tears down.
+      let enc: Array[U8] val = match cc.encrypt(_sequence_number - 1, plaintext)
+        | let e: Array[U8] val => e
+        | let _: SshCryptoError => recover val Array[U8] end
+        end
+      let out = recover iso Array[U8](enc.size()) end
+      out.append(enc)
+      return consume out
+    end
 
     // Per-packet GCM: create a fresh cipher context with the current IV,
     // then increment the IV's last 8 bytes for the next packet.
@@ -123,7 +170,10 @@ class SshPacketWriter
           SshCipherContext.aes_256_gcm(key, iv, true)?
         end
         try ctx.set_aad(pkt_len_bytes)? end
-        let encrypted = ctx.encrypt(body, true)
+        let encrypted = match ctx.encrypt(body, true)
+          | let e: Array[U8] val => e
+          | let _: SshCryptoError => return recover iso Array[U8] end
+          end
         let gcm_tag = match ctx.tag_value()
         | let t: Array[U8] val => t
         | None => recover val Array[U8] end
@@ -134,12 +184,9 @@ class SshPacketWriter
         out.append(gcm_tag)
         return consume out
       else
-        // Cipher creation failed, return plaintext (should not happen)
-        return recover iso
-          let out = Array[U8].create(plaintext.size())
-          for b in plaintext.values() do out.push(b) end
-          out
-        end
+        // Cipher setup failed: emit nothing rather than leaking the plaintext
+        // packet. The peer fails to parse it and the session tears down.
+        return recover iso Array[U8] end
       end
     end
 
@@ -158,7 +205,10 @@ class SshPacketWriter
         SshMac.compute_sha256(mkey, mac_input)
       end
       // Encrypt entire packet (including packet_length)
-      let encrypted = ctx.encrypt_stream(plaintext)
+      let encrypted = match ctx.encrypt_stream(plaintext)
+        | let e: Array[U8] val => e
+        | let _: SshCryptoError => return recover iso Array[U8] end
+        end
       let out = recover iso Array[U8](encrypted.size() + _mac_len) end
       out.append(encrypted)
       out.append(mac, 0, _mac_len)
@@ -176,7 +226,10 @@ class SshPacketWriter
           let pkt_len_bytes: Array[U8] val = pt_r.block(4)?
           let body: Array[U8] val = pt_r.block(plaintext.size() - 4)?
           ctx.set_aad(pkt_len_bytes)?
-          let encrypted = ctx.encrypt(body, true)
+          let encrypted = match ctx.encrypt(body, true)
+            | let e: Array[U8] val => e
+            | let _: SshCryptoError => error
+            end
           let gcm_tag = match ctx.tag_value()
           | let t: Array[U8] val => t
           | None => recover val Array[U8] end
@@ -191,7 +244,10 @@ class SshPacketWriter
         end
       else
         let plaintext: Array[U8] val = consume result
-        let encrypted = ctx.encrypt(plaintext)
+        let encrypted = match ctx.encrypt(plaintext, false)
+          | let e: Array[U8] val => e
+          | let _: SshCryptoError => return recover iso Array[U8] end
+          end
         let out = recover iso Array[U8](encrypted.size()) end
         out.append(encrypted)
         consume out
@@ -241,6 +297,8 @@ class SshPacketReader
   var _mac_key: (Array[U8] val | None) = None
   var _use_sha512: Bool = false
   var _block_size: USize = 16
+  // chacha20-poly1305@openssh.com: integrated cipher + MAC keyed by sequence
+  var _chacha: (SshChacha20Poly1305Context | None) = None
   // Decrypted first block (waiting for rest of packet)
   var _decrypted_first_block: (Array[U8] val | None) = None
   var _first_block_packet_length: U32 = 0
@@ -281,6 +339,13 @@ class SshPacketReader
     _use_sha512 = use_sha512
     _is_aead = false
 
+  fun ref set_chacha20_poly1305(ctx: SshChacha20Poly1305Context) =>
+    """
+    Set up chacha20-poly1305@openssh.com decryption. The context carries both
+    keys; the packet sequence number is the nonce.
+    """
+    _chacha = ctx
+
   fun ref clear_decrypt_ctx() =>
     _decrypt_ctx = None
     _mac_digest_len = 0
@@ -288,11 +353,16 @@ class SshPacketReader
     _gcm_iv = None
     _stream_ctx = None
     _mac_key = None
+    _chacha = None
     _decrypted_first_block = None
 
   fun ref append(data: Array[U8] val) =>
     """Append incoming TCP bytes to the internal buffer."""
     _buf.append(data)
+
+  fun buffered_size(): USize =>
+    """Bytes currently buffered but not yet consumed into a packet/line."""
+    _buf.size()
 
   fun ref read(): (Array[U8] val | SshTransportError | None) =>
     """
@@ -302,6 +372,39 @@ class SshPacketReader
     - SshTransportError on protocol error
     - None if not enough data yet
     """
+    // chacha20-poly1305: decrypt the length header to learn the frame size,
+    // then decrypt and authenticate the full packet once it has arrived.
+    match _chacha
+    | let cc: SshChacha20Poly1305Context =>
+      if _buf.size() < 4 then return None end
+      let enc_len = try _buf.peek_u32_be()? else return SshPacketCorrupt end
+      let enc_header = recover val
+        let b = Array[U8].create(4)
+        b.push((enc_len >> 24).u8()); b.push((enc_len >> 16).u8())
+        b.push((enc_len >> 8).u8()); b.push(enc_len.u8())
+        b
+      end
+      let packet_length = match cc.decrypt_length(_sequence_number, enc_header)
+      | let pl: U32 => pl
+      | let _: SshCryptoError => return SshPacketCorrupt
+      end
+      if packet_length.usize() > 35000 then return SshPacketTooLarge end
+      let total_needed = 4 + packet_length.usize() + 16
+      if _buf.size() < total_needed then return None end
+      return try
+        let frame: Array[U8] val = _buf.block(total_needed)?
+        match cc.decrypt(_sequence_number, frame)
+        | let p: Array[U8] val =>
+          let payload = _extract_payload_with_header(p)?
+          _sequence_number = _sequence_number + 1
+          payload
+        | let _: SshCryptoError => SshPacketCorrupt
+        end
+      else
+        SshPacketCorrupt
+      end
+    end
+
     // Per-packet GCM: create a fresh cipher context with the current IV,
     // then increment the IV's last 8 bytes for the next packet.
     match (_gcm_key, _gcm_iv)
@@ -390,7 +493,10 @@ class SshPacketReader
       if _buf.size() < _block_size then return None end
       let first_block_enc: Array[U8] val = try _buf.block(_block_size)?
       else return SshPacketCorrupt end
-      let first_block = ctx.decrypt_stream(first_block_enc)
+      let first_block = match ctx.decrypt_stream(first_block_enc)
+        | let d: Array[U8] val => d
+        | let _: SshCryptoError => return SshPacketCorrupt
+        end
       // Extract packet_length via buffered.Reader
       let fb_reader = Reader
       fb_reader.append(first_block)
@@ -415,7 +521,10 @@ class SshPacketReader
     try
       // Step 3: Decrypt remaining encrypted bytes
       let remaining_dec = if remaining_encrypted > 0 then
-        ctx.decrypt_stream(_buf.block(remaining_encrypted)?)
+        match ctx.decrypt_stream(_buf.block(remaining_encrypted)?)
+        | let d: Array[U8] val => d
+        | let _: SshCryptoError => error
+        end
       else
         recover val Array[U8] end
       end
