@@ -51,22 +51,13 @@ class SshChacha20Poly1305Context
 
     let pkt_len_bytes = recover val
       let b = Array[U8].create(4)
-      try
-        b.push(plaintext_packet(0)?)
-        b.push(plaintext_packet(1)?)
-        b.push(plaintext_packet(2)?)
-        b.push(plaintext_packet(3)?)
-      end
+      b.copy_from(plaintext_packet, 0, 0, 4)
       b
     end
 
     let body = recover val
       let b = Array[U8].create(plaintext_packet.size() - 4)
-      var i: USize = 4
-      while i < plaintext_packet.size() do
-        try b.push(plaintext_packet(i)?) end
-        i = i + 1
-      end
+      b.copy_from(plaintext_packet, 4, 0, plaintext_packet.size() - 4)
       b
     end
 
@@ -92,11 +83,10 @@ class SshChacha20Poly1305Context
       // Assemble: encrypted_header || encrypted_body || poly_tag
       let result = recover val
         let r = Array[U8].create(4 + encrypted_body.size() + 16)
-        for b in encrypted_header.values() do r.push(b) end
-        for b in encrypted_body.values() do r.push(b) end
+        r.copy_from(encrypted_header, 0, r.size(), encrypted_header.size())
+        r.copy_from(encrypted_body, 0, r.size(), encrypted_body.size())
         match poly_tag
-        | let t: Array[U8] val =>
-          for b in t.values() do r.push(b) end
+        | let t: Array[U8] val => r.copy_from(t, 0, r.size(), t.size())
         end
         r
       end
@@ -119,10 +109,7 @@ class SshChacha20Poly1305Context
 
     let enc_header = recover val
       let b = Array[U8].create(4)
-      try
-        b.push(data(0)?); b.push(data(1)?)
-        b.push(data(2)?); b.push(data(3)?)
-      end
+      b.copy_from(data, 0, 0, 4)
       b
     end
 
@@ -151,16 +138,13 @@ class SshChacha20Poly1305Context
       // Extract encrypted body and tag
       let enc_body = recover val
         let b = Array[U8].create(packet_length.usize())
-        var i: USize = 4
-        let end_i = 4 + packet_length.usize()
-        while i < end_i do try b.push(data(i)?) end; i = i + 1 end
+        b.copy_from(data, 4, 0, packet_length.usize())
         b
       end
 
       let poly_tag = recover val
         let t = Array[U8].create(16)
-        var i: USize = data.size() - 16
-        while i < data.size() do try t.push(data(i)?) end; i = i + 1 end
+        t.copy_from(data, data.size() - 16, 0, 16)
         t
       end
 
@@ -174,8 +158,8 @@ class SshChacha20Poly1305Context
       | let dec_body: Array[U8] val =>
         let result = recover val
           let r = Array[U8].create(4 + dec_body.size())
-          for b in dec_header.values() do r.push(b) end
-          for b in dec_body.values() do r.push(b) end
+          r.copy_from(dec_header, 0, r.size(), dec_header.size())
+          r.copy_from(dec_body, 0, r.size(), dec_body.size())
           r
         end
         result

@@ -1,6 +1,10 @@
 use "collections"
 use "../ssh_error"
 
+primitive SshChannelWindow
+  """The receive window ponyssh advertises for each channel it opens/accepts."""
+  fun initial(): U32 => 0x200000  // 2 MiB
+
 class SshChannelManager
   var _next_local_id: U32 = 0
   let _channels: Map[U32, SshChannelState] = Map[U32, SshChannelState]
@@ -9,7 +13,7 @@ class SshChannelManager
     """Allocate local channel ID and create pending state."""
     let id = _next_local_id
     _next_local_id = _next_local_id + 1
-    let initial_window: U32 = 0x200000  // 2MB
+    let initial_window: U32 = SshChannelWindow.initial()
     _channels(id) = SshChannelState(id, 0, initial_window, 0, 0, channel_type)
     id
 
@@ -33,7 +37,7 @@ class SshChannelManager
     """Accept an incoming channel open from remote (server side)."""
     let id = _next_local_id
     _next_local_id = _next_local_id + 1
-    let initial_window: U32 = 0x200000
+    let initial_window: U32 = SshChannelWindow.initial()
     _channels(id) = SshChannelState(id, remote_id, initial_window,
       remote_window, max_packet_size, channel_type)
     id
@@ -52,12 +56,43 @@ class SshChannelManager
       SshChannelClosed
     end
 
-  fun ref channel_data_received(local_id: U32, data_size: USize) =>
-    """Decrease local window after receiving data."""
+  fun ref channel_data_received(local_id: U32, data_size: USize):
+    (U32 | SshChannelError)
+  =>
+    """
+    Account for received data against the receive window. Returns the remaining
+    window on success, or SshWindowExhausted if the peer sent more than the
+    window we advertised (a flow-control violation we must not silently absorb).
+    """
     try
       let ch = _channels(local_id)?
-      let size = data_size.u32().min(ch.local_window)
-      ch.local_window = ch.local_window - size
+      if not ch.open then return SshChannelClosed end
+      if ch.local_window < data_size.u32() then return SshWindowExhausted end
+      ch.local_window = ch.local_window - data_size.u32()
+      ch.local_window
+    else
+      SshChannelClosed
+    end
+
+  fun ref replenish_local_window(local_id: U32): (U32 | None) =>
+    """
+    If the receive window has fallen below half its initial size, top it back
+    up to the initial size and return the increment to advertise to the peer
+    via SSH_MSG_CHANNEL_WINDOW_ADJUST. Returns None when no adjustment is due.
+    Without this the peer's send window decays to zero and the channel stalls.
+    """
+    try
+      let ch = _channels(local_id)?
+      let initial = SshChannelWindow.initial()
+      if ch.local_window < (initial / 2) then
+        let increment = initial - ch.local_window
+        ch.local_window = ch.local_window + increment
+        increment
+      else
+        None
+      end
+    else
+      None
     end
 
   fun ref window_adjust(local_id: U32, bytes: U32) =>

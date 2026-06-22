@@ -122,8 +122,10 @@ class SshPacketWriter
       let buf = Array[U8].create(4 + packet_length.usize())
       for chunk in (consume chunks).values() do
         match chunk
-        | let a: Array[U8] val => for b in a.values() do buf.push(b) end
-        | let s: String => for b in s.values() do buf.push(b) end
+        | let a: Array[U8] val => buf.copy_from(a, 0, buf.size(), a.size())
+        | let s: String =>
+          let sa = s.array()
+          buf.copy_from(sa, 0, buf.size(), sa.size())
         end
       end
       buf
@@ -264,8 +266,10 @@ class SshPacketWriter
     let out = recover iso Array[U8](total) end
     for chunk in (consume chunks).values() do
       match chunk
-      | let a: Array[U8] val => out.append(a)
-      | let s: String => out.append(s.array())
+      | let a: Array[U8] val => out.copy_from(a, 0, out.size(), a.size())
+      | let s: String =>
+        let sa = s.array()
+        out.copy_from(sa, 0, out.size(), sa.size())
       end
     end
     consume out
@@ -502,6 +506,12 @@ class SshPacketReader
       fb_reader.append(first_block)
       let pkt_len = try fb_reader.u32_be()? else return SshPacketCorrupt end
       if pkt_len.usize() > 35000 then return SshPacketTooLarge end
+      // packet_length must cover at least the bytes already in this first
+      // block beyond the 4-byte length field. Below that, `total_encrypted -
+      // _block_size` underflows (USize) and the "enough data?" check in step 2
+      // can never be satisfied, wedging the reader forever on a packet whose
+      // first block is already consumed. Reject instead of hanging.
+      if (4 + pkt_len.usize()) < _block_size then return SshPacketCorrupt end
       _decrypted_first_block = first_block
       _first_block_packet_length = pkt_len
     end
@@ -634,8 +644,10 @@ class SshPacketReader
     let out = recover iso Array[U8](total) end
     for chunk in (consume chunks).values() do
       match chunk
-      | let a: Array[U8] val => out.append(a)
-      | let s: String => out.append(s.array())
+      | let a: Array[U8] val => out.copy_from(a, 0, out.size(), a.size())
+      | let s: String =>
+        let sa = s.array()
+        out.copy_from(sa, 0, out.size(), sa.size())
       end
     end
     consume out
