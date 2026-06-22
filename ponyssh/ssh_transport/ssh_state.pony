@@ -20,6 +20,9 @@ class SshStateKeyExchange
   var shared_secret: (Array[U8] val | None) = None
   var exchange_hash: (Array[U8] val | None) = None
   var awaiting_host_key_verification: Bool = false
+  // Client-side: set when the server's NEWKEYS has arrived while host-key
+  // approval is still pending, so accept_host_key() knows to start auth.
+  var server_newkeys_received: Bool = false
   var our_kex: (SshKexCurve25519 | None) = None
 
   new create(our_kexinit': Array[U8] val, their_kexinit': Array[U8] val,
@@ -40,8 +43,6 @@ class SshStateAuth
 class SshStateConnected
   """Fully authenticated, channels active."""
   let session_id: Array[U8] val
-  var rekeying: Bool = false
-  var rekey_outbound_queue: Array[Array[U8] val] = Array[Array[U8] val]
 
   new create(session_id': Array[U8] val) =>
     session_id = session_id'

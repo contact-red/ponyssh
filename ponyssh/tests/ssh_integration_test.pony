@@ -15,7 +15,10 @@ class iso _TestIntegrationHandshake is UnitTest
     h.long_test(10_000_000_000)  // 10 second timeout
 
     let pem = _TestEd25519Pem()
-    let server_config = SshServerConfig(pem, "127.0.0.1", "19827")
+    let server_config =
+      try SshServerConfig(pem, "127.0.0.1", "19827")?
+      else h.fail("invalid host key"); return
+      end
 
     let server_notify = _IntegrationServerNotify(h)
     let listen_auth = TCPListenAuth(h.env.root)
@@ -82,7 +85,15 @@ actor _IntegrationServerNotify is SshServerNotify
   be set_listener(listener: SshListener tag) =>
     _listener = listener
 
-  be ssh_session_started(session: SshSession tag) => None
+  be ssh_session_started(session: SshSession tag) =>
+    // Only one connection is expected; stop listening immediately so a failed
+    // handshake can never leave a listener bound to the port (a leaked
+    // listener would block — and silently mis-route — later test runs).
+    match _listener
+    | let l: SshListener tag =>
+      l.dispose()
+      _listener = None
+    end
 
   be ssh_auth_request(session: SshSession tag, request: SshAuthRequest val) =>
     session.auth_accept()

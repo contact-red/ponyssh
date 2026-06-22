@@ -96,7 +96,6 @@ primitive SshDefaultAlgorithms
       a.push("aes256-gcm@openssh.com")
       a.push("aes128-gcm@openssh.com")
       a.push("aes256-ctr")
-      a.push("aes128-cbc")
       a
     end
     let mac = recover val

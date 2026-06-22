@@ -7,9 +7,12 @@ class SshKexStateMachine
   new create(role: SshRole) =>
     _role = role
 
-  fun ref generate_kexinit(prefs: SshAlgorithmPreferences val): Array[U8] val =>
-    """Generate our SSH_MSG_KEXINIT payload with random 16-byte cookie."""
-    let cookie = SshRandom.random_bytes(16)
+  fun ref generate_kexinit(prefs: SshAlgorithmPreferences val): Array[U8] val ? =>
+    """
+    Generate our SSH_MSG_KEXINIT payload with a random 16-byte cookie. Errors
+    if the CSPRNG fails.
+    """
+    let cookie = SshRandom.random_bytes(16)?
     SshMessages.kexinit(prefs, consume cookie)
 
   fun ref receive_kexinit(their_payload: Array[U8] val,
@@ -37,38 +40,83 @@ class SshKexStateMachine
   fun ref derive_keys(shared_secret: Array[U8] val,
     exchange_hash: Array[U8] val, session_id: Array[U8] val,
     negotiated: SshNegotiatedAlgorithms val):
-    SshDerivedKeys val
+    SshDerivedKeys val ?
   =>
     """
-    Derive encryption keys per RFC 4253 section 7.2.
+    Derive encryption keys per RFC 4253 section 7.2. Errors if the underlying
+    SHA-256 computation fails (rather than producing zero-filled keys).
 
     Each key is: HASH(K || H || X || session_id)
     where K = shared secret (mpint), H = exchange hash, X = single letter.
     """
-    let iv_c2s = _derive_key(shared_secret, exchange_hash, 'A', session_id)
-    let iv_s2c = _derive_key(shared_secret, exchange_hash, 'B', session_id)
-    let enc_key_c2s = _derive_key(shared_secret, exchange_hash, 'C', session_id)
-    let enc_key_s2c = _derive_key(shared_secret, exchange_hash, 'D', session_id)
-    let mac_key_c2s = _derive_key(shared_secret, exchange_hash, 'E', session_id)
-    let mac_key_s2c = _derive_key(shared_secret, exchange_hash, 'F', session_id)
+    // Encryption keys may need up to 64 bytes (chacha20-poly1305) and MAC
+    // keys up to 64 bytes (HMAC-SHA-512); IVs never exceed 16 bytes. Derive
+    // a generous length and let each cipher take the prefix it needs.
+    let iv_c2s = _derive_key(shared_secret, exchange_hash, 'A', session_id, 32)?
+    let iv_s2c = _derive_key(shared_secret, exchange_hash, 'B', session_id, 32)?
+    let enc_key_c2s = _derive_key(shared_secret, exchange_hash, 'C', session_id, 64)?
+    let enc_key_s2c = _derive_key(shared_secret, exchange_hash, 'D', session_id, 64)?
+    let mac_key_c2s = _derive_key(shared_secret, exchange_hash, 'E', session_id, 64)?
+    let mac_key_s2c = _derive_key(shared_secret, exchange_hash, 'F', session_id, 64)?
 
     SshDerivedKeys(iv_c2s, iv_s2c, enc_key_c2s, enc_key_s2c,
       mac_key_c2s, mac_key_s2c)
 
   fun _derive_key(shared_secret: Array[U8] val, exchange_hash: Array[U8] val,
-    letter: U8, session_id: Array[U8] val): Array[U8] val
+    letter: U8, session_id: Array[U8] val, output_len: USize): Array[U8] val ?
   =>
-    """Compute HASH(K_mpint || H || letter || session_id) using SHA-256."""
+    """
+    Derive output_len bytes of key material per RFC 4253 section 7.2:
+
+      K1 = HASH(K_mpint || H || letter || session_id)
+      K2 = HASH(K_mpint || H || K1)
+      Kn = HASH(K_mpint || H || K1 || ... || K(n-1))
+      key = (K1 || K2 || ... || Kn) truncated to output_len
+
+    where K = shared secret (as mpint) and H = exchange hash. SHA-256 yields
+    32 bytes per round, so keys longer than 32 bytes (chacha20's 64,
+    HMAC-SHA-512's 64) require additional rounds. The first 32 bytes are
+    identical to a single-round derivation, so shorter keys are unaffected.
+    """
     let mpint = _encode_mpint(shared_secret)
-    let input = recover val
+    let k1_input = recover val
       let buf = Array[U8]
-      for b in mpint.values() do buf.push(b) end
-      for b in exchange_hash.values() do buf.push(b) end
+      buf.append(mpint)
+      buf.append(exchange_hash)
       buf.push(letter)
-      for b in session_id.values() do buf.push(b) end
+      buf.append(session_id)
       buf
     end
-    SshHash.sha256(input)
+    var material: Array[U8] val = SshHash.sha256(k1_input)?
+    while material.size() < output_len do
+      let ext_input = recover val
+        let buf = Array[U8]
+        buf.append(mpint)
+        buf.append(exchange_hash)
+        buf.append(material)
+        buf
+      end
+      let next = SshHash.sha256(ext_input)?
+      material = recover val
+        let buf = Array[U8](material.size() + next.size())
+        buf.append(material)
+        buf.append(next)
+        buf
+      end
+    end
+    if material.size() == output_len then
+      material
+    else
+      recover val
+        let buf = Array[U8](output_len)
+        var i: USize = 0
+        while i < output_len do
+          try buf.push(material(i)?) end
+          i = i + 1
+        end
+        buf
+      end
+    end
 
   fun _encode_mpint(value: Array[U8] val): Array[U8] val =>
     """Encode value as SSH mpint (big-endian with length prefix, leading zero if high bit set)."""

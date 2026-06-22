@@ -34,8 +34,12 @@ class val SshServerConfig
   new val create(host_key_pem': Array[U8] val,
     listen_host': String val = "127.0.0.1",
     listen_port': String val = "22",
-    algorithms': (SshAlgorithmPreferences val | None) = None)
+    algorithms': (SshAlgorithmPreferences val | None) = None) ?
   =>
+    // Validate the host key up front. Without this an unparseable key is only
+    // discovered at key-exchange time, after which the server silently drops
+    // every connection. Erroring here surfaces the misconfiguration at setup.
+    SshHostKeyPair.create(host_key_pem')?
     host_key_pem = host_key_pem'
     listen_host = listen_host'
     listen_port = listen_port'
@@ -128,16 +132,21 @@ actor SshSession
     end
 
   be accept_host_key() =>
-    // NEWKEYS was already sent when the signature was verified.
-    // This just clears the awaiting flag. If we've already transitioned
-    // to Auth (received server's NEWKEYS), this is a no-op.
+    // The consumer has approved the server's host key. Clear the gate; if the
+    // server's NEWKEYS has already arrived (auth was held pending approval),
+    // begin authentication now. Encryption was activated when NEWKEYS arrived.
     match _state
     | let s: SshStateKeyExchange =>
       s.awaiting_host_key_verification = false
+      if s.server_newkeys_received then
+        _begin_authentication()
+      end
     end
 
   be reject_host_key() =>
-    _disconnect_with_error(SshProtocolVersionMismatch)
+    // The consumer rejected the server's host key. Tear down before any
+    // credentials are sent.
+    _disconnect_with_error(SshKexFailed(SshKeyInvalid))
 
   be disconnect(msg: String val = "") =>
     """Clean disconnect initiated by consumer."""
@@ -300,7 +309,12 @@ actor SshSession
           // Send our KEXINIT and transition to key exchange
           match _kex
           | let kex: SshKexStateMachine =>
-            let our_kexinit = kex.generate_kexinit(_prefs)
+            let our_kexinit =
+              try kex.generate_kexinit(_prefs)?
+              else
+                _disconnect_with_error(SshKexFailed(SshKeyInvalid))
+                return
+              end
             _our_kexinit = our_kexinit
             _send_packet(our_kexinit)
             // Transition to KeyExchange state. We don't yet have their KEXINIT,
@@ -316,9 +330,18 @@ actor SshSession
         end
         // Non-SSH lines are pre-auth banners, skip them
       | None =>
+        // Bound the pre-handshake buffer. RFC 4253 caps the version line at
+        // 255 bytes; we allow generous room for optional preceding banner
+        // lines. Without this an unauthenticated peer that never sends a line
+        // terminator could grow the buffer without bound (memory DoS).
+        if _reader.buffered_size() > _max_version_exchange_bytes() then
+          _disconnect_with_error(SshProtocolVersionMismatch)
+        end
         return  // Not enough data yet
       end
     end
+
+  fun _max_version_exchange_bytes(): USize => 8192
 
   fun ref _dispatch_packet(payload: Array[U8] val) =>
     """Route a decrypted payload to the appropriate handler based on state."""
@@ -423,15 +446,22 @@ actor SshSession
       else
         recover val Array[U8] end
       end
-      // Activate encryption using stored key exchange results
+      // Activate encryption using stored key exchange results. Only advance to
+      // authentication once a cipher is actually installed; on failure
+      // _activate_encryption has already torn the connection down.
       match _state
       | let kex_s: SshStateKeyExchange =>
-        _activate_encryption(kex_s, session_id)
-      end
-      _state = SshStateAuth(session_id)
-      match _role
-      | SshRoleClient =>
-        _send_packet(SshAuthMessages.service_request("ssh-userauth"))
+        if _activate_encryption(kex_s, session_id) then
+          // A client must not begin authentication — which puts its
+          // credentials on the wire — until the consumer has approved the
+          // server's host key. If approval is still pending, hold here;
+          // accept_host_key() resumes via _begin_authentication.
+          if kex_s.awaiting_host_key_verification then
+            kex_s.server_newkeys_received = true
+          else
+            _begin_authentication()
+          end
+        end
       end
     end
 
@@ -471,7 +501,7 @@ actor SshSession
           let exchange_hash = _compute_exchange_hash(
             client_version, server_version,
             s.their_kexinit, s.our_kexinit,
-            host_key_blob, client_pub, server_pub, shared_secret)
+            host_key_blob, client_pub, server_pub, shared_secret)?
 
           // Set session_id (first exchange hash per RFC 4253)
           if _context.session_id is None then
@@ -527,22 +557,22 @@ actor SshSession
         | let v: String val => v
         else ""
         end
-        let exchange_hash = _compute_exchange_hash(
-          client_version, server_version,
-          s.our_kexinit, s.their_kexinit,
-          host_key_blob, client_pub, server_pub, shared_secret)
-
-        // Set session_id
-        if _context.session_id is None then
-          _context.session_id = exchange_hash
-        end
-
-        // Store shared secret and exchange hash for key derivation after NEWKEYS
-        s.shared_secret = shared_secret
-        s.exchange_hash = exchange_hash
-
         // Parse host key blob to get SshHostKey
         try
+          let exchange_hash = _compute_exchange_hash(
+            client_version, server_version,
+            s.our_kexinit, s.their_kexinit,
+            host_key_blob, client_pub, server_pub, shared_secret)?
+
+          // Set session_id
+          if _context.session_id is None then
+            _context.session_id = exchange_hash
+          end
+
+          // Store shared secret and exchange hash for key derivation after NEWKEYS
+          s.shared_secret = shared_secret
+          s.exchange_hash = exchange_hash
+
           let kr = SshWireReader(host_key_blob)
           let algo = kr.read_string_as_str()?
           let pk_data = kr.read_string()?
@@ -583,12 +613,13 @@ actor SshSession
     client_kexinit: Array[U8] val, server_kexinit: Array[U8] val,
     host_key_blob: Array[U8] val,
     client_pub: Array[U8] val, server_pub: Array[U8] val,
-    shared_secret: Array[U8] val): Array[U8] val
+    shared_secret: Array[U8] val): Array[U8] val ?
   =>
     """
     Compute the full exchange hash per RFC 4253 section 8 / RFC 8731:
     H = SHA256(string(V_C) || string(V_S) || string(I_C) || string(I_S)
               || string(K_S) || string(Q_C) || string(Q_S) || mpint(K))
+    Errors if the SHA-256 computation fails.
     """
     let hash_input = recover val
       let w = SshWireWriter
@@ -602,124 +633,167 @@ actor SshSession
       w.write_mpint(shared_secret)
       w.val_bytes()
     end
-    SshHash.sha256(hash_input)
+    SshHash.sha256(hash_input)?
 
-  fun ref _activate_encryption(s: SshStateKeyExchange, session_id: Array[U8] val) =>
+  fun ref _activate_encryption(s: SshStateKeyExchange, session_id: Array[U8] val):
+    Bool
+  =>
     """
-    Derive keys from the completed key exchange and activate per-packet
-    AES-256-GCM encryption on the reader and writer.
+    Derive keys from the completed key exchange and activate the negotiated
+    cipher on the reader and writer. Returns true once a cipher is installed.
+    Returns false — after tearing the connection down — when key material is
+    missing or the negotiated cipher is unsupported, so the session is never
+    marked encrypted without a cipher actually in place.
     """
-    match (s.shared_secret, s.exchange_hash)
-    | (let shared: Array[U8] val, let hash: Array[U8] val) =>
-      match _kex
-      | let kex: SshKexStateMachine =>
-        let keys = kex.derive_keys(shared, hash, session_id, s.negotiated)
-
-        // Determine which key/IV pair to use based on role.
-        // c2s = client-to-server, s2c = server-to-client.
-        // Reader decrypts incoming, writer encrypts outgoing.
-        (let write_key, let write_iv, let read_key, let read_iv) = match _role
-        | SshRoleClient =>
-          (keys.enc_key_c2s, keys.iv_c2s, keys.enc_key_s2c, keys.iv_s2c)
-        | SshRoleServer =>
-          (keys.enc_key_s2c, keys.iv_s2c, keys.enc_key_c2s, keys.iv_c2s)
-        end
-
-        let cipher_name = s.negotiated.cipher_c2s  // same for both directions
-
-        if (cipher_name == "aes256-gcm@openssh.com")
-          or (cipher_name == "aes128-gcm@openssh.com")
-        then
-          // AEAD: per-packet GCM with 12-byte IV, last 8 bytes incremented
-          let write_iv_12 = recover val
-            let b = Array[U8].create(12)
-            var i: USize = 0
-            while i < 12 do try b.push(write_iv(i)?) end; i = i + 1 end
-            b
-          end
-          let read_iv_12 = recover val
-            let b = Array[U8].create(12)
-            var i: USize = 0
-            while i < 12 do try b.push(read_iv(i)?) end; i = i + 1 end
-            b
-          end
-          // Truncate key to cipher's key length (16 for aes128, 32 for aes256)
-          let key_len: USize = if cipher_name == "aes128-gcm@openssh.com"
-            then 16 else 32 end
-          let wk = recover val
-            let b = Array[U8].create(key_len)
-            var i: USize = 0
-            while i < key_len do try b.push(write_key(i)?) end; i = i + 1 end
-            b
-          end
-          let rk = recover val
-            let b = Array[U8].create(key_len)
-            var i: USize = 0
-            while i < key_len do try b.push(read_key(i)?) end; i = i + 1 end
-            b
-          end
-          _writer.set_gcm_params(wk, write_iv_12)
-          _reader.set_gcm_params(rk, read_iv_12)
-        elseif (cipher_name == "aes256-ctr") or (cipher_name == "aes128-cbc") then
-          // Stream cipher: persistent context + HMAC
-          // IV is first 16 bytes of derived IV (AES block size)
-          let write_iv_16 = recover val
-            let b = Array[U8].create(16)
-            var i: USize = 0
-            while i < 16 do try b.push(write_iv(i)?) end; i = i + 1 end
-            b
-          end
-          let read_iv_16 = recover val
-            let b = Array[U8].create(16)
-            var i: USize = 0
-            while i < 16 do try b.push(read_iv(i)?) end; i = i + 1 end
-            b
-          end
-
-          // MAC keys
-          (let write_mac_key, let read_mac_key) = match _role
-          | SshRoleClient =>
-            (keys.mac_key_c2s, keys.mac_key_s2c)
-          | SshRoleServer =>
-            (keys.mac_key_s2c, keys.mac_key_c2s)
-          end
-
-          let mac_name = s.negotiated.mac_c2s
-          let use_sha512 = mac_name == "hmac-sha2-512"
-          let mac_len: USize = if use_sha512 then 64 else 32 end
-
-          try
-            let w_ctx = if cipher_name == "aes256-ctr" then
-              SshCipherContext.aes_256_ctr(write_key, write_iv_16, true)?
-            else
-              SshCipherContext.aes_128_cbc(write_key, write_iv_16, true)?
-            end
-            let r_ctx = if cipher_name == "aes256-ctr" then
-              SshCipherContext.aes_256_ctr(read_key, read_iv_16, false)?
-            else
-              SshCipherContext.aes_128_cbc(read_key, read_iv_16, false)?
-            end
-            _writer.set_stream_cipher(w_ctx, write_mac_key, mac_len, use_sha512)
-            _reader.set_stream_cipher(r_ctx, read_mac_key, mac_len, 16, use_sha512)
-          end
-        end
-
-        _encrypted = true
+    (let shared: Array[U8] val, let hash: Array[U8] val) =
+      match (s.shared_secret, s.exchange_hash)
+      | (let sh: Array[U8] val, let h: Array[U8] val) => (sh, h)
+      else
+        _disconnect_with_error(SshKexFailed(SshKeyInvalid))
+        return false
       end
+
+    let kex = match _kex
+    | let k: SshKexStateMachine => k
+    else
+      _disconnect_with_error(SshKexFailed(SshKeyInvalid))
+      return false
+    end
+
+    let keys =
+      try
+        kex.derive_keys(shared, hash, session_id, s.negotiated)?
+      else
+        _disconnect_with_error(SshKexFailed(SshKeyInvalid))
+        return false
+      end
+
+    // c2s = client-to-server, s2c = server-to-client. The reader decrypts
+    // incoming packets, the writer encrypts outgoing ones.
+    (let write_key: Array[U8] val, let write_iv: Array[U8] val,
+     let read_key: Array[U8] val, let read_iv: Array[U8] val,
+     let write_mac_key: Array[U8] val, let read_mac_key: Array[U8] val) =
+      match _role
+      | SshRoleClient =>
+        (keys.enc_key_c2s, keys.iv_c2s, keys.enc_key_s2c, keys.iv_s2c,
+         keys.mac_key_c2s, keys.mac_key_s2c)
+      | SshRoleServer =>
+        (keys.enc_key_s2c, keys.iv_s2c, keys.enc_key_c2s, keys.iv_c2s,
+         keys.mac_key_s2c, keys.mac_key_c2s)
+      end
+
+    let cipher_name = s.negotiated.cipher_c2s  // same for both directions
+
+    if cipher_name == "chacha20-poly1305@openssh.com" then
+      // 64 bytes of key material per direction: main_key(32) || header_key(32).
+      // No separate IV or MAC key — poly1305 is the MAC, the nonce is the
+      // packet sequence number.
+      try
+        let w_cc = SshChacha20Poly1305Context(_first_bytes(write_key, 64))?
+        let r_cc = SshChacha20Poly1305Context(_first_bytes(read_key, 64))?
+        _writer.set_chacha20_poly1305(w_cc)
+        _reader.set_chacha20_poly1305(r_cc)
+      else
+        _disconnect_with_error(SshKexFailed(SshKeyInvalid))
+        return false
+      end
+    elseif (cipher_name == "aes256-gcm@openssh.com")
+      or (cipher_name == "aes128-gcm@openssh.com")
+    then
+      // AEAD: per-packet GCM with 12-byte IV, last 8 bytes incremented
+      let write_iv_12 = recover val
+        let b = Array[U8].create(12)
+        var i: USize = 0
+        while i < 12 do try b.push(write_iv(i)?) end; i = i + 1 end
+        b
+      end
+      let read_iv_12 = recover val
+        let b = Array[U8].create(12)
+        var i: USize = 0
+        while i < 12 do try b.push(read_iv(i)?) end; i = i + 1 end
+        b
+      end
+      // Truncate key to cipher's key length (16 for aes128, 32 for aes256)
+      let key_len: USize = if cipher_name == "aes128-gcm@openssh.com"
+        then 16 else 32 end
+      let wk = _first_bytes(write_key, key_len)
+      let rk = _first_bytes(read_key, key_len)
+      _writer.set_gcm_params(wk, write_iv_12)
+      _reader.set_gcm_params(rk, read_iv_12)
+    elseif (cipher_name == "aes256-ctr") or (cipher_name == "aes128-cbc") then
+      // Stream cipher: persistent context + HMAC.
+      // IV is first 16 bytes of derived IV (AES block size).
+      let write_iv_16 = _first_bytes(write_iv, 16)
+      let read_iv_16 = _first_bytes(read_iv, 16)
+
+      let mac_name = s.negotiated.mac_c2s
+      let use_sha512 = mac_name == "hmac-sha2-512"
+      let mac_len: USize = if use_sha512 then 64 else 32 end
+      // HMAC uses the whole key array, so slice to the exact MAC key length.
+      let w_mac = _first_bytes(write_mac_key, mac_len)
+      let r_mac = _first_bytes(read_mac_key, mac_len)
+
+      try
+        let w_ctx = if cipher_name == "aes256-ctr" then
+          SshCipherContext.aes_256_ctr(write_key, write_iv_16, true)?
+        else
+          SshCipherContext.aes_128_cbc(write_key, write_iv_16, true)?
+        end
+        let r_ctx = if cipher_name == "aes256-ctr" then
+          SshCipherContext.aes_256_ctr(read_key, read_iv_16, false)?
+        else
+          SshCipherContext.aes_128_cbc(read_key, read_iv_16, false)?
+        end
+        _writer.set_stream_cipher(w_ctx, w_mac, mac_len, use_sha512)
+        _reader.set_stream_cipher(r_ctx, r_mac, mac_len, 16, use_sha512)
+      else
+        _disconnect_with_error(SshKexFailed(SshKeyInvalid))
+        return false
+      end
+    else
+      // Negotiated a cipher the transport cannot apply. Fail closed rather
+      // than fall through and send plaintext on a session marked encrypted.
+      _disconnect_with_error(SshAlgorithmNegotiationFailed)
+      return false
+    end
+
+    _encrypted = true
+    true
+
+  fun _first_bytes(src: Array[U8] val, n: USize): Array[U8] val =>
+    """
+    Return a copy of the first n bytes of src. src is expected to hold at
+    least n bytes; a shorter src yields a shorter result, which downstream
+    construction (e.g. the chacha context) rejects.
+    """
+    recover val
+      let b = Array[U8].create(n)
+      var i: USize = 0
+      while i < n do
+        try b.push(src(i)?) end
+        i = i + 1
+      end
+      b
     end
 
   fun ref _handle_auth(msg_type: U8, payload: Array[U8] val) =>
     """Handle messages during authentication."""
     match msg_type
     | SshAuthMsgTypes.userauth_success() =>
-      let session_id = match _context.session_id
-      | let id: Array[U8] val => id
-      else
-        recover val Array[U8] end
-      end
-      _state = SshStateConnected(session_id)
-      match _client_notify
-      | let n: SshClientNotify tag => n.ssh_ready(this)
+      // Only a client acts on USERAUTH_SUCCESS. A server that receives this
+      // message has authenticated nothing; acting on it would let a client
+      // jump straight to Connected, bypassing authentication entirely.
+      match _role
+      | SshRoleClient =>
+        let session_id = match _context.session_id
+        | let id: Array[U8] val => id
+        else
+          recover val Array[U8] end
+        end
+        _state = SshStateConnected(session_id)
+        match _client_notify
+        | let n: SshClientNotify tag => n.ssh_ready(this)
+        end
       end
     | SshAuthMsgTypes.userauth_failure() =>
       match _auth
@@ -758,6 +832,22 @@ actor SshSession
           else
             SshAuthNoneData  // Unknown method treated as none
           end
+          // For a signed publickey request, prove possession of the private
+          // key before consulting the consumer. An invalid signature is
+          // rejected here, so the consumer is only ever asked to authorize a
+          // key whose ownership has been cryptographically established.
+          match method_data
+          | let pkd: SshAuthPublicKeyData val =>
+            match pkd.signature
+            | let _: Array[U8] val =>
+              if not _verify_publickey_signature(username, service, pkd) then
+                _send_packet(SshAuthMessages.userauth_failure(
+                  ["publickey"; "password"], false))
+                return
+              end
+            end
+          end
+
           let request = SshAuthRequest(username, method, method_data)
           match _server_notify
           | let n: SshServerNotify tag => n.ssh_auth_request(this, request)
@@ -949,9 +1039,12 @@ actor SshSession
     | SshChannelMsgTypes.channel_success() => None
     | SshChannelMsgTypes.channel_failure() => None
     | SshMsgTypes.kexinit() =>
-      // Rekeying
-      state.rekeying = true
-      _handle_kex(msg_type, payload)
+      // A peer is initiating a mid-session rekey. We do not yet support
+      // rekeying; rather than silently corrupt the session (the old code
+      // re-ran key exchange and dropped back into authentication), tear the
+      // connection down cleanly. Long-lived sessions that need rekeying are a
+      // future feature.
+      _disconnect_with_error(SshRekeyUnsupported)
     | SshMsgTypes.disconnect() =>
       _state = SshStateDisconnected(SshConnectionLost)
       _notify_disconnected()
@@ -984,6 +1077,39 @@ actor SshSession
     match _bridge
     | let b: SshClientTcpBridge tag => b.dispose()
     | let b: SshServerTcpBridge tag => b.dispose()
+    end
+
+  fun ref _begin_authentication() =>
+    """
+    Transition to the authentication phase. Called once encryption is active
+    and, on a client, the server's host key has been approved. A client kicks
+    off authentication by requesting the ssh-userauth service; a server waits
+    for the client to do so.
+    """
+    let session_id = match _context.session_id
+    | let id: Array[U8] val => id
+    else
+      recover val Array[U8] end
+    end
+    _state = SshStateAuth(session_id)
+    match _role
+    | SshRoleClient =>
+      _send_packet(SshAuthMessages.service_request("ssh-userauth"))
+    end
+
+  fun _verify_publickey_signature(username: String val, service: String val,
+    pk: SshAuthPublicKeyData val): Bool
+  =>
+    """
+    Verify a publickey userauth signature against the established session id.
+    Delegates to SshPublicKeyVerifier; without a session id (which is always
+    set by the time auth runs) verification fails closed.
+    """
+    match _context.session_id
+    | let id: Array[U8] val =>
+      SshPublicKeyVerifier.verify(id, username, service, pk)
+    else
+      false
     end
 
   // --- Notification helpers ---

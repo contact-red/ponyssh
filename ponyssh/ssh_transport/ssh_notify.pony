@@ -73,10 +73,23 @@ interface SshServerNotify
         session.auth_reject(["publickey";"password"])
       end
     | let pk: SshAuthPublicKeyData val =>
-      if (validate_publickey(request.username, pk)) then
-        session.auth_accept()
-      else
-        session.auth_reject(["publickey";"password"])
+      match pk.signature
+      | None =>
+        // Probe phase: the client is asking whether this key is acceptable.
+        // Reply PK_OK so it proceeds to sign; this grants no access on its own.
+        if validate_publickey(request.username, pk) then
+          session.auth_pk_ok(pk.algorithm, pk.public_key)
+        else
+          session.auth_reject(["publickey";"password"])
+        end
+      | let _: Array[U8] val =>
+        // Signature phase: the library has already verified the signature, so
+        // possession of the private key is proven. Only authorization remains.
+        if validate_publickey(request.username, pk) then
+          session.auth_accept()
+        else
+          session.auth_reject(["publickey";"password"])
+        end
       end
     else
       session.auth_reject(["publickey";"password"])

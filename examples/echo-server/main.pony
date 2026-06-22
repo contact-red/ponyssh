@@ -18,10 +18,10 @@ actor Main
     let pem: Array[U8] val = _EchoServerKey()
     let ciphers = recover val
       let a = Array[String val]
+      a.push("chacha20-poly1305@openssh.com")
       a.push("aes256-gcm@openssh.com")
       a.push("aes128-gcm@openssh.com")
       a.push("aes256-ctr")
-      a.push("aes128-cbc")
       a
     end
     let prefs = SshAlgorithmPreferences(
@@ -30,7 +30,10 @@ actor Main
       ciphers, ciphers,
       recover val let a = Array[String val]; a.push("hmac-sha2-256"); a end,
       recover val let a = Array[String val]; a.push("hmac-sha2-256"); a end)
-    let config = SshServerConfig(pem, "0.0.0.0", "2222", prefs)
+    let config =
+      try SshServerConfig(pem, "0.0.0.0", "2222", prefs)?
+      else env.out.print("Invalid host key; aborting."); return
+      end
     let auth = TCPListenAuth(env.root)
     SshListener(auth, config, EchoServerNotify(env))
 

@@ -11,7 +11,7 @@ class iso _TestMacRoundtrip is UnitTest
     end
     PonyCheck.for_all[Array[U8] iso](data_gen, h)(
       {(data: Array[U8] iso, ph: PropertyHelper) =>
-        let key: Array[U8] val = SshRandom.random_bytes(32)
+        let key: Array[U8] val = _TestBytes(32)
         let d: Array[U8] val = consume data
         let mac1 = SshMac.compute_sha256(key, d)
         let mac2 = SshMac.compute_sha256(key, d)
@@ -22,7 +22,7 @@ class iso _TestMacBitFlip is UnitTest
   fun name(): String => "ssh_crypto/mac/sha256_bit_flip"
 
   fun apply(h: TestHelper) =>
-    let key: Array[U8] val = SshRandom.random_bytes(32)
+    let key: Array[U8] val = _TestBytes(32)
     let data: Array[U8] val = "hello mac bit flip test".array()
 
     let mac = SshMac.compute_sha256(key, data)
