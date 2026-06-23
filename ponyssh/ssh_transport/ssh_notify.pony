@@ -4,6 +4,14 @@ use "../ssh_connection"
 use "../ssh_auth"
 
 interface SshClientNotify
+  """
+  Client-side consumer interface. The session calls these as the connection
+  progresses: it must approve or reject the server host key
+  (ssh_verify_host_key → session.accept_host_key/reject_host_key), is told when
+  the session is ready and authenticated (ssh_ready), and receives channel and
+  error events. Every callback receives the session tag so the consumer can
+  drive it.
+  """
   be ssh_verify_host_key(session: SshSession tag, host: String val, key: SshHostKey val)
   be ssh_ready(session: SshSession tag)
   be ssh_auth_failed(session: SshSession tag, err: SshAuthError val)

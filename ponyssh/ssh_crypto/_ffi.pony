@@ -153,10 +153,6 @@ use @BIO_free[I32](a: Pointer[None] tag)
 // Random
 use @RAND_bytes[I32](buf: Pointer[U8] tag, num: I32)
 
-// Debug output helpers (used in ifdef debug blocks)
-use @pony_os_stderr[Pointer[U8]]()
-use @fprintf[I32](stream: Pointer[U8] tag, fmt: Pointer[U8] tag, ...)
-
 // Error handling
 use @ERR_get_error[U64]()
 use @ERR_error_string[Pointer[U8] tag](e: U64, buf: Pointer[U8] tag)

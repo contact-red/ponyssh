@@ -589,11 +589,16 @@ class SshPacketReader
     // Now consume
     try
       _buf.skip(4)?  // packet_length field (already peeked)
-      let padding_length = _buf.u8()?
-      let payload_length = packet_length.usize() - 1 - padding_length.usize()
-      if padding_length.usize() < 4 then return SshPacketCorrupt end
+      let padding_length = _buf.u8()?.usize()
+      // Validate before subtracting: padding_length must be in range and leave
+      // room within packet_length, or the USize subtraction below underflows.
+      if padding_length < 4 then return SshPacketCorrupt end
+      if (1 + padding_length) > packet_length.usize() then
+        return SshPacketCorrupt
+      end
+      let payload_length = packet_length.usize() - 1 - padding_length
       let payload: Array[U8] val = _buf.block(payload_length)?
-      _buf.skip(padding_length.usize())?  // discard padding
+      _buf.skip(padding_length)?  // discard padding
       _sequence_number = _sequence_number + 1
       payload
     else
@@ -608,6 +613,7 @@ class SshPacketReader
     r.append(decrypted)
     let padding_length = r.u8()?.usize()
     if padding_length < 4 then error end
+    if (1 + padding_length) > decrypted.size() then error end
     let payload_length = decrypted.size() - 1 - padding_length
     if (1 + payload_length + padding_length) != decrypted.size() then error end
     r.block(payload_length)?
@@ -622,6 +628,7 @@ class SshPacketReader
     let pkt_len = r.u32_be()?.usize()
     let padding_length = r.u8()?.usize()
     if padding_length < 4 then error end
+    if (1 + padding_length) > pkt_len then error end
     let payload_length = pkt_len - 1 - padding_length
     r.block(payload_length)?
 

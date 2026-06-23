@@ -55,24 +55,43 @@ use "ssh_server"
 
 actor Main
   new create(env: Env) =>
-    let pem: Array[U8] val = // your host key, PEM-encoded
-    let ciphers = recover val
-      let a = Array[String val]
-      a.push("aes256-gcm@openssh.com")
-      a
-    end
-    let prefs = SshAlgorithmPreferences(
-      recover val let a = Array[String val]; a.push("curve25519-sha256"); a end,
-      recover val let a = Array[String val]; a.push("ssh-ed25519"); a end,
-      ciphers, ciphers,
-      recover val let a = Array[String val]; a.push("hmac-sha2-256"); a end,
-      recover val let a = Array[String val]; a.push("hmac-sha2-256"); a end)
-    let config = SshServerConfig(pem, "0.0.0.0", "2222", prefs)
+    let pem: Array[U8] val = MyHostKey()  // your host key, PEM-encoded
+
+    // SshServerConfig validates the host key, so its constructor is partial.
+    // Algorithm preferences default to the implemented set; to customise them
+    // pass `SshAlgorithmPreferences` with named arguments and override only the
+    // categories you need.
+    let config =
+      try
+        SshServerConfig(pem, "0.0.0.0", "2222")?
+      else
+        env.out.print("invalid host key; aborting")
+        return
+      end
+
     let auth = TCPListenAuth(env.root)
     SshListener(auth, config, MyServerNotify(env))
 ```
 
-Your `MyServerNotify` implements `SshServerNotify` to validate credentials and handle channel events.
+Your `MyServerNotify` implements `SshServerNotify`. Authentication and authorization **deny by default**: implement `validate_password` / `validate_publickey` to accept credentials, and override the channel/shell callbacks to grant access (they reject unless overridden).
+
+A minimal client:
+
+```pony
+use "lori"
+use "ssh_transport"
+use "ssh_auth"
+use "ssh_client"
+
+actor Main
+  new create(env: Env) =>
+    let config = SshClientConfig("example.com", "22", "alice",
+      recover val [as SshAuthMethod val: SshPasswordAuth("hunter2")] end)
+    let auth = TCPConnectAuth(env.root)
+    SshConnector.connect(auth, config, MyClientNotify(env))
+```
+
+`MyClientNotify` implements `SshClientNotify`. It must approve the server host key in `ssh_verify_host_key` (call `session.accept_host_key()` or `session.reject_host_key()`) and acts on the session once `ssh_ready` fires.
 
 ## API Documentation
 

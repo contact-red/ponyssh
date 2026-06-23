@@ -7,17 +7,25 @@ class iso _TestAuthMessageEncode is UnitTest
   fun name(): String => "ssh_auth/message/encode_password_request"
 
   fun apply(h: TestHelper) =>
-    let msg = SshAuthMessages.userauth_request_password("alice", "ssh-connection", "s3cr3t")
+    let msg = SshAuthMessages.userauth_request_password(
+      "alice", "ssh-connection", "s3cr3t")
 
-    // First byte must be SSH_MSG_USERAUTH_REQUEST (50)
-    let first = try msg(0)? else h.fail("empty message"); return end
-    h.assert_eq[U8](first, SshAuthMsgTypes.userauth_request())
-
-    // Username "alice" must appear as a substring in the encoded bytes
-    let as_str = String.from_array(msg)
-    h.assert_true(as_str.contains("alice"), "username 'alice' not found in encoded message")
-    h.assert_true(as_str.contains("s3cr3t"), "password 's3cr3t' not found in encoded message")
-    h.assert_true(as_str.contains("password"), "method 'password' not found in encoded message")
+    // Decode field-by-field (RFC 4252 §8): byte(SSH_MSG_USERAUTH_REQUEST) ||
+    // string(user) || string(service) || string("password") || bool(false) ||
+    // string(password). A substring check would miss field reordering or a
+    // dropped length prefix; decoding pins the exact structure.
+    let r = SshWireReader(msg)
+    try
+      h.assert_eq[U8](SshAuthMsgTypes.userauth_request(), r.read_byte()?)
+      h.assert_eq[String val]("alice", r.read_string_as_str()?)
+      h.assert_eq[String val]("ssh-connection", r.read_string_as_str()?)
+      h.assert_eq[String val]("password", r.read_string_as_str()?)
+      h.assert_false(r.read_bool()?, "the change-password flag must be false")
+      h.assert_eq[String val]("s3cr3t", r.read_string_as_str()?)
+      h.assert_eq[USize](0, r.remaining(), "no trailing bytes expected")
+    else
+      h.fail("password userauth request did not decode")
+    end
 
 class iso _TestAuthStateMachineTriesMethods is UnitTest
   fun name(): String => "ssh_auth/state_machine/tries_methods_in_order"
