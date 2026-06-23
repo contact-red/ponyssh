@@ -10,7 +10,12 @@ class val SshHostKey
     public_key_data = public_key_data'
 
 class SshHostKeyPair
-  """Ed25519 key pair loaded from PEM. Holds a private key and can sign data."""
+  """
+  An Ed25519 key pair loaded from PEM: holds the private key and can sign and
+  expose the public key. Despite the name it backs both roles — a server's host
+  key and a client's user authentication key — since the underlying operations
+  (load, sign, public_key) are identical.
+  """
   let algorithm: String val
   let _pkey: Pointer[None] tag
 
@@ -73,6 +78,10 @@ primitive SshHostKeyVerify
   fun verify(key: SshHostKey val, signature: Array[U8] val,
     data: Array[U8] val): (Bool | SshCryptoError)
   =>
+    // Only ssh-ed25519 host keys are supported. Reject any other algorithm
+    // explicitly rather than relying on OpenSSL's raw-key length check to fail
+    // closed for us.
+    if key.algorithm != "ssh-ed25519" then return SshKeyInvalid end
     let pkey = @EVP_PKEY_new_raw_public_key(_NidEd25519(), Pointer[None],
       key.public_key_data.cpointer(), key.public_key_data.size())
     if pkey.is_null() then return SshKeyInvalid end
