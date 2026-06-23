@@ -2,6 +2,11 @@ use "lori"
 use "../ssh_transport"
 
 actor SshListener is TCPListenerActor
+  """
+  Accepts inbound TCP connections on the configured host/port and starts a
+  server SshSession for each, wiring its TCP bridge and notifying the consumer's
+  SshServerNotify. Call dispose() (inherited) to stop listening.
+  """
   var _tcp_listener: TCPListener = TCPListener.none()
   let _config: SshServerConfig val
   let _notify: SshServerNotify tag

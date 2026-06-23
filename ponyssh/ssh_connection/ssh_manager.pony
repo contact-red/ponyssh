@@ -102,13 +102,6 @@ class SshChannelManager
       ch.remote_window = ch.remote_window + bytes
     end
 
-  fun ref local_window_adjust(local_id: U32, bytes: U32) =>
-    """Increase local window for channel (used when sending WINDOW_ADJUST to remote)."""
-    try
-      let ch = _channels(local_id)?
-      ch.local_window = ch.local_window + bytes
-    end
-
   fun ref close_channel(local_id: U32) =>
     """Remove channel state."""
     try _channels.remove(local_id)? end

@@ -1,6 +1,44 @@
 use "../ssh_error"
 
+primitive SshAlgorithmDefaults
+  """
+  The per-category default algorithm lists. These back both the constructor
+  defaults of SshAlgorithmPreferences and SshDefaultAlgorithms.preferences, so
+  the two never drift, and they list only algorithms the transport implements.
+  """
+  fun kex(): Array[String val] val =>
+    recover val let a = Array[String val]; a.push("curve25519-sha256"); a end
+
+  fun host_key(): Array[String val] val =>
+    recover val let a = Array[String val]; a.push("ssh-ed25519"); a end
+
+  fun ciphers(): Array[String val] val =>
+    recover val
+      let a = Array[String val]
+      a.push("chacha20-poly1305@openssh.com")
+      a.push("aes256-gcm@openssh.com")
+      a.push("aes128-gcm@openssh.com")
+      a.push("aes256-ctr")
+      a
+    end
+
+  fun macs(): Array[String val] val =>
+    recover val
+      let a = Array[String val]
+      a.push("hmac-sha2-256")
+      a.push("hmac-sha2-512")
+      a
+    end
+
 class val SshAlgorithmPreferences
+  """
+  Per-category algorithm preference lists. Every parameter defaults to the
+  implemented set, so construct with named arguments and override only what
+  differs — e.g. `SshAlgorithmPreferences(where cipher_client_to_server' =
+  my_ciphers, cipher_server_to_client' = my_ciphers)`. Passing all six lists
+  positionally is error-prone (they share a type, so a transposition compiles
+  silently); prefer named arguments.
+  """
   let kex: Array[String val] val
   let host_key: Array[String val] val
   let cipher_client_to_server: Array[String val] val
@@ -9,12 +47,14 @@ class val SshAlgorithmPreferences
   let mac_server_to_client: Array[String val] val
 
   new val create(
-    kex': Array[String val] val,
-    host_key': Array[String val] val,
-    cipher_client_to_server': Array[String val] val,
-    cipher_server_to_client': Array[String val] val,
-    mac_client_to_server': Array[String val] val,
-    mac_server_to_client': Array[String val] val)
+    kex': Array[String val] val = SshAlgorithmDefaults.kex(),
+    host_key': Array[String val] val = SshAlgorithmDefaults.host_key(),
+    cipher_client_to_server': Array[String val] val =
+      SshAlgorithmDefaults.ciphers(),
+    cipher_server_to_client': Array[String val] val =
+      SshAlgorithmDefaults.ciphers(),
+    mac_client_to_server': Array[String val] val = SshAlgorithmDefaults.macs(),
+    mac_server_to_client': Array[String val] val = SshAlgorithmDefaults.macs())
   =>
     kex = kex'
     host_key = host_key'
@@ -24,6 +64,7 @@ class val SshAlgorithmPreferences
     mac_server_to_client = mac_server_to_client'
 
 class val SshNegotiatedAlgorithms
+  """The single algorithm chosen per category once negotiation completes."""
   let kex: String val
   let host_key: String val
   let cipher_c2s: String val
@@ -105,31 +146,9 @@ primitive SshSupportedAlgorithms
 
 primitive SshDefaultAlgorithms
   fun preferences(): SshAlgorithmPreferences val =>
-    // Advertise only what the transport actually implements. Offering
-    // algorithms we cannot perform (nistp256, DH groups, ECDSA/RSA host keys)
-    // lets a peer negotiate one and then watch the handshake die mid-exchange.
-    let kex = recover val
-      let a = Array[String val]
-      a.push("curve25519-sha256")
-      a
-    end
-    let host_key = recover val
-      let a = Array[String val]
-      a.push("ssh-ed25519")
-      a
-    end
-    let cipher = recover val
-      let a = Array[String val]
-      a.push("chacha20-poly1305@openssh.com")
-      a.push("aes256-gcm@openssh.com")
-      a.push("aes128-gcm@openssh.com")
-      a.push("aes256-ctr")
-      a
-    end
-    let mac = recover val
-      let a = Array[String val]
-      a.push("hmac-sha2-256")
-      a.push("hmac-sha2-512")
-      a
-    end
-    SshAlgorithmPreferences(kex, host_key, cipher, cipher, mac, mac)
+    """
+    The default preferences: only algorithms the transport implements, in
+    descending preference. Identical to a default-constructed
+    SshAlgorithmPreferences; both draw from SshAlgorithmDefaults.
+    """
+    SshAlgorithmPreferences

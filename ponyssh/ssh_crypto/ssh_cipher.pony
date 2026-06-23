@@ -1,47 +1,5 @@
 use "../ssh_error"
 
-interface val SshCipherAlgorithm
-  fun name(): String val
-  fun key_len(): USize
-  fun iv_len(): USize
-  fun block_len(): USize
-  fun is_aead(): Bool
-
-primitive SshAes256Gcm is SshCipherAlgorithm
-  fun name(): String val => "aes256-gcm@openssh.com"
-  fun key_len(): USize => 32
-  fun iv_len(): USize => 12
-  fun block_len(): USize => 16
-  fun is_aead(): Bool => true
-
-primitive SshAes128Gcm is SshCipherAlgorithm
-  fun name(): String val => "aes128-gcm@openssh.com"
-  fun key_len(): USize => 16
-  fun iv_len(): USize => 12
-  fun block_len(): USize => 16
-  fun is_aead(): Bool => true
-
-primitive SshAes256Ctr is SshCipherAlgorithm
-  fun name(): String val => "aes256-ctr"
-  fun key_len(): USize => 32
-  fun iv_len(): USize => 16
-  fun block_len(): USize => 16
-  fun is_aead(): Bool => false
-
-primitive SshAes128Cbc is SshCipherAlgorithm
-  fun name(): String val => "aes128-cbc"
-  fun key_len(): USize => 16
-  fun iv_len(): USize => 16
-  fun block_len(): USize => 16
-  fun is_aead(): Bool => false
-
-primitive SshChacha20Poly1305 is SshCipherAlgorithm
-  fun name(): String val => "chacha20-poly1305@openssh.com"
-  fun key_len(): USize => 64
-  fun iv_len(): USize => 0
-  fun block_len(): USize => 8
-  fun is_aead(): Bool => true
-
 class ref SshCipherContext
   var _ctx: Pointer[None] tag
   let _encrypting: Bool

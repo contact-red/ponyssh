@@ -7,17 +7,23 @@ use "../ssh_connection"
 type _SshBridge is (SshClientTcpBridge tag | SshServerTcpBridge tag)
 
 class val SshClientConfig
+  """
+  Immutable configuration for an outbound client session: the host and port to
+  connect to, the username, the authentication methods to try in order, and the
+  algorithm preferences (defaulting to the implemented set).
+  """
   let host: String val
   let port: String val
   let username: String val
   let auth_methods: Array[SshAuthMethod val] val
-  let algorithms: (SshAlgorithmPreferences val | None)
+  let algorithms: SshAlgorithmPreferences val
 
   new val create(host': String val, port': String val,
     username': String val = "",
     auth_methods': Array[SshAuthMethod val] val =
       recover val Array[SshAuthMethod val] end,
-    algorithms': (SshAlgorithmPreferences val | None) = None)
+    algorithms': SshAlgorithmPreferences val =
+      SshDefaultAlgorithms.preferences())
   =>
     host = host'
     port = port'
@@ -26,15 +32,22 @@ class val SshClientConfig
     algorithms = algorithms'
 
 class val SshServerConfig
+  """
+  Immutable configuration for a server: the PEM-encoded host key, the listen
+  host and port, and the algorithm preferences (defaulting to the implemented
+  set). The constructor is partial — it validates the host key up front so a
+  bad key fails at setup rather than at key-exchange time.
+  """
   let host_key_pem: Array[U8] val
   let listen_host: String val
   let listen_port: String val
-  let algorithms: (SshAlgorithmPreferences val | None)
+  let algorithms: SshAlgorithmPreferences val
 
   new val create(host_key_pem': Array[U8] val,
     listen_host': String val = "127.0.0.1",
     listen_port': String val = "22",
-    algorithms': (SshAlgorithmPreferences val | None) = None) ?
+    algorithms': SshAlgorithmPreferences val =
+      SshDefaultAlgorithms.preferences()) ?
   =>
     // Validate the host key up front. Without this an unparseable key is only
     // discovered at key-exchange time, after which the server silently drops
@@ -46,6 +59,13 @@ class val SshServerConfig
     algorithms = algorithms'
 
 actor SshSession
+  """
+  Owns one SSH connection: the protocol state machine, the TCP bridge, packet
+  framing/crypto, key exchange (including rekey), authentication, and channel
+  multiplexing. Consumers do not construct this directly — use SshConnector
+  (client) or SshListener (server) — and interact with it through the tag passed
+  to their SshClientNotify / SshServerNotify callbacks.
+  """
   let _role: SshRole
   let _client_notify: (SshClientNotify tag | None)
   let _server_notify: (SshServerNotify tag | None)
@@ -80,6 +100,10 @@ actor SshSession
   let _pending_sends: Array[Array[U8] val] = Array[Array[U8] val]
   var _write_baseline: U32 = 0
   var _read_baseline: U32 = 0
+  // Set the first time the session enters its terminal state, so teardown runs
+  // once: the consumer sees a single ssh_disconnected and no duplicate
+  // DISCONNECT is sent into an already-closed bridge.
+  var _terminated: Bool = false
 
   let _version_string: String val = "SSH-2.0-ponyssh_0.1"
 
@@ -91,9 +115,7 @@ actor SshSession
     _role = SshRoleClient
     _client_notify = notify
     _server_notify = None
-    match config.algorithms
-    | let p: SshAlgorithmPreferences val => _prefs = p
-    end
+    _prefs = config.algorithms
     _kex = SshKexStateMachine(SshRoleClient)
     _auth = SshAuthStateMachine(config.username, config.auth_methods)
     _remote_host = config.host
@@ -103,19 +125,23 @@ actor SshSession
     _role = SshRoleServer
     _client_notify = None
     _server_notify = notify
-    match config.algorithms
-    | let p: SshAlgorithmPreferences val => _prefs = p
-    end
+    _prefs = config.algorithms
     _kex = SshKexStateMachine(SshRoleServer)
     _auth = None
     try _host_key = SshHostKeyPair.create(config.host_key_pem)? end
-    // Bridge set separately via _set_bridge
-
-  be _set_bridge(bridge: SshServerTcpBridge tag) =>
-    _bridge = bridge
+    // The server bridge is wired immediately after construction by SshListener
+    // via set_server_bridge (the bridge needs the session as its notify target,
+    // so the session must exist first).
 
   be set_server_bridge(bridge: SshServerTcpBridge tag) =>
-    _bridge = bridge
+    """
+    Wire the TCP bridge for a server session. Accepted only once, right after
+    construction; a later call (e.g. from consumer code) cannot replace the
+    bridge of a live session.
+    """
+    match _bridge
+    | None => _bridge = bridge
+    end
 
   // --- Public behaviors (called by consumers) ---
 
@@ -129,13 +155,51 @@ actor SshSession
 
   be channel_send(channel_id: U32, data: Array[U8] val) =>
     match _state
-    | let _: SshStateConnected =>
-      match _channel_manager.channel_data_send(channel_id, data.size())
+    | let _: SshStateConnected => _channel_send_segmented(channel_id, data)
+    end
+
+  fun ref _channel_send_segmented(channel_id: U32, data: Array[U8] val) =>
+    """
+    Split outbound channel data into packets no larger than the peer's
+    advertised max_packet_size (and no larger than its remaining send window),
+    rather than emitting one oversized CHANNEL_DATA a conformant peer rejects.
+    """
+    let max_packet = match _channel_manager.get(channel_id)
+      | let ch: SshChannelState =>
+        let m = ch.max_packet_size.usize()
+        if m == 0 then 32768 else m end
+      | None =>
+        _notify_channel_error(channel_id, SshChannelClosed)
+        return
+      end
+    var offset: USize = 0
+    while offset < data.size() do
+      let window = match _channel_manager.get(channel_id)
+        | let ch: SshChannelState => ch.remote_window.usize()
+        | None =>
+          _notify_channel_error(channel_id, SshChannelClosed)
+          return
+        end
+      if window == 0 then
+        // The peer's send window is exhausted; the remainder cannot go out
+        // until it grants more via CHANNEL_WINDOW_ADJUST.
+        _notify_channel_error(channel_id, SshWindowExhausted)
+        return
+      end
+      let seg_len = (data.size() - offset).min(max_packet).min(window)
+      let segment = recover val
+        let b = Array[U8].create(seg_len)
+        b.copy_from(data, offset, 0, seg_len)
+        b
+      end
+      match _channel_manager.channel_data_send(channel_id, seg_len)
       | let remote_id: U32 =>
-        _send_packet(SshChannelMessages.channel_data(remote_id, data))
+        _send_packet(SshChannelMessages.channel_data(remote_id, segment))
       | let err: SshChannelError =>
         _notify_channel_error(channel_id, err)
+        return
       end
+      offset = offset + seg_len
     end
 
   be channel_close(channel_id: U32) =>
@@ -170,6 +234,8 @@ actor SshSession
 
   be disconnect(msg: String val = "") =>
     """Clean disconnect initiated by consumer."""
+    if _terminated then return end
+    _terminated = true
     _send_packet(SshMessages.disconnect(
       SshDisconnectCodes.by_application(), msg))
     _close_bridge()
@@ -265,28 +331,17 @@ actor SshSession
     _process_packets()
 
   be _tcp_closed() =>
+    if _terminated then return end
+    _terminated = true
     _state = SshStateDisconnected(SshConnectionLost)
     _notify_disconnected()
 
   be _tcp_connection_failed() =>
+    if _terminated then return end
+    _terminated = true
     _state = SshStateDisconnected(SshConnectionLost)
     _notify_error(SshConnectionLost)
     _notify_disconnected()
-
-  // --- Crypto worker result behaviors ---
-
-  be _kex_computed(our_public: Array[U8] val, shared_secret: Array[U8] val) =>
-    """Crypto worker completed key exchange computation."""
-    match _state
-    | let s: SshStateKeyExchange =>
-      s.shared_secret = shared_secret
-      // TODO: compute exchange hash, verify host key, send NEWKEYS
-      // For now, just store the result
-    end
-
-  be _kex_failed(err: SshKexFailed) =>
-    """Crypto worker failed key exchange."""
-    _disconnect_with_error(err)
 
   // --- Private methods ---
 
@@ -383,8 +438,7 @@ actor SshSession
       // Global messages handled in any state (RFC 4253 §11)
       match msg_type
       | SshMsgTypes.disconnect() =>
-        _state = SshStateDisconnected(SshConnectionLost)
-        _notify_disconnected()
+        _peer_disconnected()
         return
       | SshMsgTypes.ignore() => return    // silently discard
       | SshMsgTypes.debug() => return     // silently discard
@@ -1197,6 +1251,14 @@ actor SshSession
           let username = r.read_string_as_str()?
           let service = r.read_string_as_str()?
           let method = r.read_string_as_str()?
+          // RFC 4252: a userauth request targets the "ssh-connection" service.
+          // Enforce it so the service value bound into a publickey signature is
+          // fixed rather than attacker-chosen.
+          if service != "ssh-connection" then
+            _send_packet(SshAuthMessages.userauth_failure(
+              ["publickey"; "password"], false))
+            return
+          end
           let method_data: SshAuthMethodData val = match method
           | "none" => SshAuthNoneData
           | "password" =>
@@ -1231,6 +1293,10 @@ actor SshSession
           match _server_notify
           | let n: SshServerNotify tag => n.ssh_auth_request(this, request)
           end
+        else
+          // A malformed/truncated auth request is a protocol violation; tear
+          // down rather than silently drop it and leave the peer waiting.
+          _disconnect_with_error(SshPacketCorrupt)
         end
       end
     | SshAuthMsgTypes.userauth_pk_ok() =>
@@ -1443,8 +1509,7 @@ actor SshSession
     | SshChannelMsgTypes.channel_success() => None
     | SshChannelMsgTypes.channel_failure() => None
     | SshMsgTypes.disconnect() =>
-      _state = SshStateDisconnected(SshConnectionLost)
-      _notify_disconnected()
+      _peer_disconnected()
     end
 
   fun ref _send_packet(payload: Array[U8] val) =>
@@ -1516,11 +1581,20 @@ actor SshSession
 
   fun ref _disconnect_with_error(err: SshTransportError) =>
     """Send SSH_MSG_DISCONNECT and transition to Disconnected."""
+    if _terminated then return end
+    _terminated = true
     _send_packet(SshMessages.disconnect(
       SshDisconnectCodes.protocol_error(), err.string()))
     _close_bridge()
     _state = SshStateDisconnected(err)
     _notify_error(err)
+    _notify_disconnected()
+
+  fun ref _peer_disconnected() =>
+    """React once to a peer-initiated DISCONNECT message."""
+    if _terminated then return end
+    _terminated = true
+    _state = SshStateDisconnected(SshConnectionLost)
     _notify_disconnected()
 
   fun ref _close_bridge() =>
