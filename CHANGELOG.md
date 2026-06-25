@@ -77,7 +77,7 @@ All notable changes to this project will be documented in this file. This projec
 - `SshPublicKeyVerifier`, which verifies a client publickey userauth signature
   against an established session id.
 
-### Removed
+### Changed
 
 - Removed `aes128-cbc` support entirely. CBC (encrypt-and-MAC over plaintext)
   is the construction the Terrapin and CBC-padding-oracle attacks target. It
