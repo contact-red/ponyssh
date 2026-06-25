@@ -33,7 +33,15 @@ primitive SshMac
   =>
     let out = recover iso Array[U8].init(0, digest_size) end
     var out_len: U32 = 0
-    @HMAC(md, key.cpointer(), key.size().i32(),
+    let rc = @HMAC(md, key.cpointer(), key.size().i32(),
       data.cpointer(), data.size(), out.cpointer(), addressof out_len)
-    out.truncate(out_len.usize())
+    // HMAC returns NULL on failure. Fail closed: an empty digest never matches
+    // a real MAC in verify(), and an empty MAC we emit is rejected by the peer,
+    // so an OpenSSL failure tears the session down rather than sending or
+    // accepting an unauthenticated packet.
+    if rc.is_null() then
+      out.truncate(0)
+    else
+      out.truncate(out_len.usize())
+    end
     consume out

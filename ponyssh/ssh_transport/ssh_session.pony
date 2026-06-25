@@ -1201,15 +1201,11 @@ actor SshSession
         if cipher_name == "aes128-gcm@openssh.com" then 16 else 32 end
       _writer.set_gcm_params(_first_bytes(key, key_len), _first_bytes(iv, 12))
       true
-    elseif (cipher_name == "aes256-ctr") or (cipher_name == "aes128-cbc") then
+    elseif cipher_name == "aes256-ctr" then
       let use_sha512 = mac_name == "hmac-sha2-512"
       let mac_len: USize = if use_sha512 then 64 else 32 end
       try
-        let ctx = if cipher_name == "aes256-ctr" then
-          SshCipherContext.aes_256_ctr(key, _first_bytes(iv, 16), true)?
-        else
-          SshCipherContext.aes_128_cbc(key, _first_bytes(iv, 16), true)?
-        end
+        let ctx = SshCipherContext.aes_256_ctr(key, _first_bytes(iv, 16), true)?
         _writer.set_stream_cipher(ctx, _first_bytes(mac_key, mac_len), mac_len,
           use_sha512)
         true
@@ -1247,15 +1243,11 @@ actor SshSession
         if cipher_name == "aes128-gcm@openssh.com" then 16 else 32 end
       _reader.set_gcm_params(_first_bytes(key, key_len), _first_bytes(iv, 12))
       true
-    elseif (cipher_name == "aes256-ctr") or (cipher_name == "aes128-cbc") then
+    elseif cipher_name == "aes256-ctr" then
       let use_sha512 = mac_name == "hmac-sha2-512"
       let mac_len: USize = if use_sha512 then 64 else 32 end
       try
-        let ctx = if cipher_name == "aes256-ctr" then
-          SshCipherContext.aes_256_ctr(key, _first_bytes(iv, 16), false)?
-        else
-          SshCipherContext.aes_128_cbc(key, _first_bytes(iv, 16), false)?
-        end
+        let ctx = SshCipherContext.aes_256_ctr(key, _first_bytes(iv, 16), false)?
         _reader.set_stream_cipher(ctx, _first_bytes(mac_key, mac_len), mac_len,
           16, use_sha512)
         true

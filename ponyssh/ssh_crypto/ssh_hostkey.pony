@@ -66,8 +66,14 @@ class SshHostKeyPair
     """Extract the public key as an SshHostKey."""
     let buf = recover iso Array[U8].init(0, 32) end
     var len: USize = 32
-    @EVP_PKEY_get_raw_public_key(_pkey, buf.cpointer(), addressof len)
-    buf.truncate(len)
+    // Fail closed on extraction failure: an empty key fails signature
+    // verification downstream rather than yielding a zero key.
+    if @EVP_PKEY_get_raw_public_key(_pkey, buf.cpointer(), addressof len) != 1
+    then
+      buf.truncate(0)
+    else
+      buf.truncate(len)
+    end
     SshHostKey(algorithm, consume buf)
 
   fun _final() =>

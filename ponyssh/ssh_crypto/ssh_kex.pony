@@ -22,8 +22,14 @@ class SshKexCurve25519
   fun public_key(): Array[U8] val =>
     let buf = recover iso Array[U8].init(0, 32) end
     var len: USize = 32
-    @EVP_PKEY_get_raw_public_key(_pkey, buf.cpointer(), addressof len)
-    buf.truncate(len)
+    // Fail closed if extraction fails: an empty key makes the peer's exchange
+    // hash disagree and the handshake aborts, rather than sending a zero key.
+    if @EVP_PKEY_get_raw_public_key(_pkey, buf.cpointer(), addressof len) != 1
+    then
+      buf.truncate(0)
+    else
+      buf.truncate(len)
+    end
     consume buf
 
   fun derive_shared_secret(peer_public: Array[U8] val): (Array[U8] val | SshCryptoError) =>

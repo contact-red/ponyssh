@@ -8,7 +8,7 @@ class SshPacketWriter
   // Per-packet GCM: key + 12-byte IV (last 8 bytes incremented per packet)
   var _gcm_key: (Array[U8] val | None) = None
   var _gcm_iv: (Array[U8] ref | None) = None
-  // Stream cipher (CTR/CBC): persistent context + MAC key
+  // Stream cipher (CTR): persistent context + MAC key
   var _stream_ctx: (SshCipherContext | None) = None
   var _mac_key: (Array[U8] val | None) = None
   var _mac_len: USize = 0
@@ -45,7 +45,7 @@ class SshPacketWriter
     mac_len: USize, use_sha512: Bool = false)
   =>
     """
-    Set up streaming encryption (CTR/CBC) with HMAC. The cipher context
+    Set up streaming encryption (CTR) with HMAC. The cipher context
     persists across packets. MAC is HMAC-SHA256 or HMAC-SHA512.
     """
     _stream_ctx = ctx
@@ -192,7 +192,7 @@ class SshPacketWriter
       end
     end
 
-    // Stream cipher (CTR/CBC) with HMAC
+    // Stream cipher (CTR) with HMAC
     match (_stream_ctx, _mac_key)
     | (let ctx: SshCipherContext, let mkey: Array[U8] val) =>
       let plaintext: Array[U8] val = consume result
@@ -304,7 +304,7 @@ class SshPacketReader
   var _gcm_key: (Array[U8] val | None) = None
   var _gcm_iv: (Array[U8] ref | None) = None
   var _mac_digest_len: USize = 0
-  // Stream cipher (CTR/CBC)
+  // Stream cipher (CTR)
   var _stream_ctx: (SshCipherContext | None) = None
   var _mac_key: (Array[U8] val | None) = None
   var _use_sha512: Bool = false
@@ -342,7 +342,7 @@ class SshPacketReader
     mac_len: USize, block_size: USize = 16, use_sha512: Bool = false)
   =>
     """
-    Set up streaming decryption (CTR/CBC) with HMAC verification.
+    Set up streaming decryption (CTR) with HMAC verification.
     """
     _stream_ctx = ctx
     _mac_key = mac_key
@@ -440,7 +440,7 @@ class SshPacketReader
       end
     end
 
-    // Stream cipher (CTR/CBC) with HMAC
+    // Stream cipher (CTR) with HMAC
     match (_stream_ctx, _mac_key)
     | (let ctx: SshCipherContext, let mkey: Array[U8] val) =>
       return _read_stream(ctx, mkey)
@@ -495,7 +495,7 @@ class SshPacketReader
     (Array[U8] val | SshTransportError | None)
   =>
     """
-    Read a stream-cipher encrypted packet (CTR/CBC) with HMAC.
+    Read a stream-cipher encrypted packet (CTR) with HMAC.
     Decrypt first block to get packet_length, then decrypt the rest,
     then verify HMAC.
     """

@@ -129,11 +129,13 @@ primitive SshSupportedAlgorithms
     name == "ssh-ed25519"
 
   fun cipher(name: String val): Bool =>
+    // aes128-cbc is deliberately absent: CBC (encrypt-and-MAC over plaintext)
+    // is the construction the Terrapin / CBC-padding-oracle attacks target, so
+    // it is not negotiable even if a consumer lists it in their preferences.
     (name == "chacha20-poly1305@openssh.com")
       or (name == "aes256-gcm@openssh.com")
       or (name == "aes128-gcm@openssh.com")
       or (name == "aes256-ctr")
-      or (name == "aes128-cbc")
 
   fun mac(name: String val): Bool =>
     (name == "hmac-sha2-256") or (name == "hmac-sha2-512")

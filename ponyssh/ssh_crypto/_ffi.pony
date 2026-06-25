@@ -41,11 +41,9 @@ use @EVP_CIPHER_CTX_ctrl[I32](
   type': I32,
   arg: I32,
   ptr: Pointer[None] tag)
-use @EVP_CIPHER_CTX_set_padding[I32](ctx: Pointer[None] tag, padding: I32)
 use @EVP_aes_256_gcm[Pointer[None] tag]()
 use @EVP_aes_128_gcm[Pointer[None] tag]()
 use @EVP_aes_256_ctr[Pointer[None] tag]()
-use @EVP_aes_128_cbc[Pointer[None] tag]()
 use @EVP_chacha20[Pointer[None] tag]()
 
 // Poly1305 via the OpenSSL 3.0 EVP_MAC interface. Used to build the
