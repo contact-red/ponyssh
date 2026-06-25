@@ -58,6 +58,15 @@ All notable changes to this project will be documented in this file. This projec
   further opens with `SSH_OPEN_RESOURCE_SHORTAGE`), and clients — which have no
   channel-authorization callback and so would otherwise orphan the state
   forever — reject inbound channel opens without allocating.
+- The X25519 shared secret is now encoded as a canonical SSH mpint (leading
+  zero bytes stripped). A non-canonical encoding diverged from OpenSSH on the
+  ~1/256 of handshakes where the secret's top byte is zero, making the exchange
+  hash disagree and the connection fail to establish against OpenSSH.
+- A `SSH_MSG_CHANNEL_WINDOW_ADJUST` that would overflow a channel's send-window
+  counter now saturates instead of wrapping the window back to a small value.
+- More OpenSSL return codes are checked and fail closed: the AEAD decrypt
+  update, the HMAC computation, and raw public-key extraction no longer ignore
+  a failure from the library.
 
 ### Added
 
@@ -70,5 +79,8 @@ All notable changes to this project will be documented in this file. This projec
 
 ### Changed
 
-- Removed `aes128-cbc` from the default cipher preferences.
+- Removed `aes128-cbc` support entirely. CBC (encrypt-and-MAC over plaintext)
+  is the construction the Terrapin and CBC-padding-oracle attacks target. It
+  was already absent from the default preferences but remained negotiable if a
+  consumer listed it explicitly; it can no longer be negotiated.
 

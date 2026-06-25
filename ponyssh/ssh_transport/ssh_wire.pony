@@ -29,19 +29,27 @@ class ref SshWireWriter
     write_string_from_str(joined)
 
   fun ref write_mpint(value: Array[U8] val) =>
-    """SSH mpint: uint32 length + big-endian bytes, with leading zero if high bit set."""
-    if value.size() == 0 then
+    """
+    SSH mpint: uint32 length + big-endian two's-complement bytes. The value is
+    first canonicalized (redundant leading 0x00 bytes stripped) so the encoding
+    matches every other implementation's — OpenSSH canonicalizes, and a
+    non-canonical encoding of the X25519 shared secret would make the exchange
+    hash disagree. A single leading zero is then re-added only when the high bit
+    is set, to keep the value non-negative.
+    """
+    let v = SshMpint.canonical(value)
+    if v.size() == 0 then
       _w.u32_be(0)
     else
       try
-        if (value(0)? and 0x80) != 0 then
-          _w.u32_be((value.size() + 1).u32())
+        if (v(0)? and 0x80) != 0 then
+          _w.u32_be((v.size() + 1).u32())
           _w.u8(0)
         else
-          _w.u32_be(value.size().u32())
+          _w.u32_be(v.size().u32())
         end
       end
-      _w.write(value)
+      _w.write(v)
     end
 
   fun ref val_bytes(): Array[U8] val =>
@@ -118,3 +126,33 @@ class SshWireReader
 
   fun remaining(): USize =>
     _r.size()
+
+primitive SshMpint
+  fun canonical(value: Array[U8] val): Array[U8] val =>
+    """
+    Strip redundant leading 0x00 bytes from a big-endian magnitude so its mpint
+    encoding is canonical. SSH mpint (RFC 4251) carries no leading zeros; a
+    non-canonical encoding of the X25519 shared secret K diverges from OpenSSH
+    (which canonicalizes), breaking the exchange hash on the ~1/256 of
+    handshakes where K's top byte is zero. An all-zero (or empty) value
+    canonicalizes to empty, which is the correct encoding of mpint 0.
+    """
+    var start: USize = 0
+    try
+      while (start < value.size()) and (value(start)? == 0) do
+        start = start + 1
+      end
+    end
+    if start == 0 then
+      value
+    else
+      recover val
+        let arr = Array[U8](value.size() - start)
+        var i: USize = start
+        while i < value.size() do
+          try arr.push(value(i)?) end
+          i = i + 1
+        end
+        arr
+      end
+    end

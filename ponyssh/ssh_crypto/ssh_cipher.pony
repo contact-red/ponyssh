@@ -74,30 +74,6 @@ class ref SshCipherContext
       error
     end
 
-  new ref aes_128_cbc(
-    key: Array[U8] val,
-    iv: Array[U8] val,
-    encrypting: Bool)
-    ?
-  =>
-    _encrypting = encrypting
-    _tag = None
-    let ctx = @EVP_CIPHER_CTX_new()
-    if ctx.is_null() then error end
-    _ctx = ctx
-    let cipher = @EVP_aes_128_cbc()
-    let rc = if encrypting then
-      @EVP_EncryptInit_ex(ctx, cipher, Pointer[None], key.cpointer(), iv.cpointer())
-    else
-      @EVP_DecryptInit_ex(ctx, cipher, Pointer[None], key.cpointer(), iv.cpointer())
-    end
-    if rc != 1 then
-      @EVP_CIPHER_CTX_free(ctx)
-      _ctx = Pointer[None]
-      error
-    end
-    @EVP_CIPHER_CTX_set_padding(ctx, 0)
-
   fun ref set_aad(aad: Array[U8] val) ? =>
     """
     Set additional authenticated data for AEAD ciphers (GCM).
@@ -166,12 +142,15 @@ class ref SshCipherContext
     let out_size = ciphertext.size() + 16
     let out = recover iso Array[U8].init(0, out_size) end
     var out_len: I32 = 0
-    @EVP_DecryptUpdate(
+    if @EVP_DecryptUpdate(
       _ctx,
       out.cpointer(),
       addressof out_len,
       ciphertext.cpointer(),
-      ciphertext.size().i32())
+      ciphertext.size().i32()) != 1
+    then
+      return SshDecryptFailed
+    end
     var final_len: I32 = 0
     let rc = @EVP_DecryptFinal_ex(
       _ctx,

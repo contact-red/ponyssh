@@ -139,25 +139,32 @@ class SshKexStateMachine
     end
 
   fun _encode_mpint(value: Array[U8] val): Array[U8] val =>
-    """Encode value as SSH mpint (big-endian with length prefix, leading zero if high bit set)."""
+    """
+    Encode value as an SSH mpint (big-endian, uint32 length prefix). The value
+    is canonicalized (redundant leading zero bytes stripped) before a single
+    leading zero is re-added when the high bit is set, matching OpenSSH's
+    encoding so the exchange-hash transcript agrees. Shares the canonicalization
+    rule with SshWireWriter.write_mpint via SshMpint.
+    """
+    let v = SshMpint.canonical(value)
     recover val
       let buf = Array[U8]
-      if value.size() == 0 then
+      if v.size() == 0 then
         buf.push(0); buf.push(0); buf.push(0); buf.push(0)
       else
         try
-          if (value(0)? and 0x80) != 0 then
-            let len = (value.size() + 1).u32()
+          if (v(0)? and 0x80) != 0 then
+            let len = (v.size() + 1).u32()
             buf.push((len >> 24).u8()); buf.push((len >> 16).u8())
             buf.push((len >> 8).u8()); buf.push(len.u8())
             buf.push(0)
           else
-            let len = value.size().u32()
+            let len = v.size().u32()
             buf.push((len >> 24).u8()); buf.push((len >> 16).u8())
             buf.push((len >> 8).u8()); buf.push(len.u8())
           end
         end
-        for b in value.values() do buf.push(b) end
+        for b in v.values() do buf.push(b) end
       end
       buf
     end

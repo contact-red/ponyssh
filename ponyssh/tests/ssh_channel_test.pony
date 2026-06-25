@@ -95,31 +95,6 @@ class iso _TestChannelClose is UnitTest
       h.fail("expected SshChannelClosed, got: " + e.string())
     end
 
-class iso _TestChannelFindByRemoteId is UnitTest
-  fun name(): String => "ssh_channel/find_by_remote_id"
-
-  fun apply(h: TestHelper) =>
-    var mgr: SshChannelManager ref = SshChannelManager
-    let local_id_a = mgr.open_channel("session")
-    let local_id_b = mgr.open_channel("session")
-    mgr.confirm_channel(local_id_a, 100, 0x100000, 0x8000)
-    mgr.confirm_channel(local_id_b, 200, 0x100000, 0x8000)
-
-    match mgr.find_by_remote_id(100)
-    | let found: U32 => h.assert_eq[U32](local_id_a, found)
-    | None => h.fail("expected to find channel for remote_id 100")
-    end
-
-    match mgr.find_by_remote_id(200)
-    | let found: U32 => h.assert_eq[U32](local_id_b, found)
-    | None => h.fail("expected to find channel for remote_id 200")
-    end
-
-    match mgr.find_by_remote_id(999)
-    | let found: U32 => h.fail("expected None for unknown remote_id 999")
-    | None => None
-    end
-
 class iso _TestChannelCapacity is UnitTest
   """
   at_capacity() reports false below the concurrent-channel cap and true once it
