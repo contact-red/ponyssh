@@ -59,6 +59,61 @@ class iso _TestChacha20Poly1305Roundtrip is UnitTest
       h.fail("decrypt failed: " + err.string())
     end
 
+class iso _TestChacha20Poly1305KnownAnswer is UnitTest
+  """
+  Pin the exact chacha20-poly1305@openssh.com wire output for a fixed key,
+  sequence number, and packet. This is the guard the symmetric round-trip tests
+  cannot provide: a refactor that silently reverts to OpenSSL's IETF
+  EVP_chacha20_poly1305 AEAD (the original bug) — or mishandles the K_1/K_2
+  split, the block counter, or the nonce — still round-trips against itself but
+  changes these bytes and breaks OpenSSH interop. The expected value was
+  captured from this implementation after verifying a full session against
+  OpenSSH 9.6.
+  """
+  fun name(): String => "ssh_crypto/chacha20poly1305/known_answer"
+
+  fun apply(h: TestHelper) =>
+    // Deterministic 64-byte key (bytes 0..63) and a fixed packet:
+    // packet_length=13 || padding_length=4 || "ponyssh!" || four 0x00 padding.
+    let key = recover val
+      let k = Array[U8].create(64)
+      var i: USize = 0
+      while i < 64 do k.push(i.u8()); i = i + 1 end
+      k
+    end
+    let plaintext = recover val
+      let p = Array[U8].create(17)
+      p.push(0); p.push(0); p.push(0); p.push(13)  // packet_length = 13
+      p.push(4)                                     // padding_length = 4
+      for b in "ponyssh!".values() do p.push(b) end // 8-byte payload
+      p.push(0); p.push(0); p.push(0); p.push(0)    // 4 padding bytes
+      p
+    end
+
+    let ctx =
+      try SshChacha20Poly1305Context(key)?
+      else h.fail("context create failed"); return
+      end
+    let out = match ctx.encrypt(7, plaintext)
+      | let c: Array[U8] val => c
+      | let e: SshCryptoError => h.fail("encrypt failed: " + e.string()); return
+      end
+
+    let hexdigits = "0123456789abcdef"
+    let actual = recover val
+      let s = String(out.size() * 2)
+      for b in out.values() do
+        try
+          s.push(hexdigits(b.usize() >> 4)?)
+          s.push(hexdigits((b and 0x0F).usize())?)
+        end
+      end
+      s
+    end
+    let expected =
+      "a39afca72c367a2d37f059364d6dbbf0d762f6b311a46b341a057b67507d35516f"
+    h.assert_eq[String](expected, actual)
+
 class iso _TestChacha20Poly1305SequenceNumberMatters is UnitTest
   fun name(): String => "ssh_crypto/chacha20poly1305/sequence_number_matters"
 

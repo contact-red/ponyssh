@@ -5,6 +5,19 @@ primitive SshChannelWindow
   """The receive window ponyssh advertises for each channel it opens/accepts."""
   fun initial(): U32 => 0x200000  // 2 MiB
 
+primitive SshChannelLimits
+  """
+  Bounds on channel state, enforced so a hostile peer cannot grow it without
+  bound.
+  """
+  fun max_concurrent(): USize =>
+    """
+    Maximum number of channels held at once. Each accepted CHANNEL_OPEN
+    allocates state advertising a 2 MiB window; without a cap a peer flooding
+    CHANNEL_OPEN could exhaust memory. 256 is generous for legitimate use.
+    """
+    256
+
 class SshChannelManager
   var _next_local_id: U32 = 0
   let _channels: Map[U32, SshChannelState] = Map[U32, SshChannelState]
@@ -118,3 +131,7 @@ class SshChannelManager
 
   fun channel_count(): USize =>
     _channels.size()
+
+  fun at_capacity(): Bool =>
+    """True once the concurrent-channel cap is reached; reject further opens."""
+    _channels.size() >= SshChannelLimits.max_concurrent()

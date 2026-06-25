@@ -288,6 +288,14 @@ class SshPacketWriter
 
   fun sequence_number(): U32 => _sequence_number
 
+  fun ref reset_sequence_number() =>
+    """
+    Reset the outgoing sequence number to zero. Used after sending NEWKEYS under
+    strict key exchange (Terrapin / CVE-2023-48795 mitigation), so the first
+    packet under a new key starts at sequence 0.
+    """
+    _sequence_number = 0
+
 class SshPacketReader
   let _buf: Reader = Reader
   var _sequence_number: U32 = 0
@@ -672,3 +680,11 @@ class SshPacketReader
     end
 
   fun sequence_number(): U32 => _sequence_number
+
+  fun ref reset_sequence_number() =>
+    """
+    Reset the incoming sequence number to zero. Used after receiving NEWKEYS
+    under strict key exchange (Terrapin / CVE-2023-48795 mitigation), so the
+    first packet under a new key is parsed at sequence 0.
+    """
+    _sequence_number = 0

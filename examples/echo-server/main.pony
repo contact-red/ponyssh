@@ -1,7 +1,5 @@
 use "lori"
-use "files"
-use "buffered"
-use "terminfo"
+use "term"
 use "collections"
 use "encode/base64"
 use "../../ponyssh/ssh_transport"
@@ -35,17 +33,10 @@ actor Main
       else env.out.print("Invalid host key; aborting."); return
       end
     let auth = TCPListenAuth(env.root)
-    SshListener(auth, config, EchoServerNotify(env))
+    SshListener(auth, config, EchoServerNotify)
 
 actor EchoServerNotify is SshServerNotify
-  let _env: Env
   let _authorized_key: Array[U8] val = _AuthorizedKey()
-  // Most recent pty for the shell we will start. A real server would track one
-  // per channel; this demo handles a single shell at a time.
-  var _pty: SshPtyState val = SshPtyState.none()
-
-  new create(env: Env) =>
-    _env = env
 
   fun validate_password(user: String val, password: String val): Bool =>
     // Don't do this™
@@ -62,18 +53,20 @@ actor EchoServerNotify is SshServerNotify
   be ssh_pty_request(session: SshSession tag, channel_id: U32,
     pty: SshPtyState val, want_reply: Bool)
   =>
-    _pty = pty
     if want_reply then session.accept_request(channel_id) end
 
   be ssh_shell_request(session: SshSession tag, channel_id: U32,
     want_reply: Bool)
   =>
     if want_reply then session.accept_request(channel_id) end
-    let terminfo =
-      TermInfos.parse_term_info(_pty.term, FileAuth(_env.root), _env.vars)
-    try session.channel_send(channel_id, terminfo.clear_screen()?) end
+    // Paint a splash of colour on the client's terminal. We emit ANSI escapes
+    // directly (the xterm-256color 38;5;N foreground select), which every
+    // modern terminal understands — no terminfo-database lookup needed for a
+    // demo.
+    session.channel_send(channel_id, ANSI.clear().array())
     for col in Range[I32](0, 255) do
-      try session.channel_send(channel_id, terminfo.set_foreground(col)?) end
+      session.channel_send(channel_id,
+        ("\x1B[38;5;" + col.string() + "m").array())
       session.channel_send(channel_id, ("Hello World!" + col.string()).array())
     end
 

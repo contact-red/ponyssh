@@ -144,6 +144,50 @@ primitive SshSupportedAlgorithms
       and cipher(n.cipher_c2s) and cipher(n.cipher_s2c)
       and mac(n.mac_c2s) and mac(n.mac_s2c)
 
+primitive SshStrictKex
+  """
+  The OpenSSH strict key-exchange extension (Terrapin / CVE-2023-48795
+  mitigation). Each side advertises a role-specific marker as a pseudo
+  key-exchange algorithm in its first KEXINIT only. When both sides advertise
+  it, strict KEX is in effect: the packet sequence number is reset to zero at
+  every NEWKEYS, and no non-key-exchange packets are tolerated during the
+  initial key exchange. The marker is appended last so it never wins
+  negotiation against a real algorithm.
+  """
+  fun client_marker(): String val => "kex-strict-c-v00@openssh.com"
+  fun server_marker(): String val => "kex-strict-s-v00@openssh.com"
+
+  fun our_marker(role: SshRole): String val =>
+    """The marker this side advertises, by role."""
+    match role
+    | SshRoleClient => client_marker()
+    | SshRoleServer => server_marker()
+    end
+
+  fun peer_advertised(their_kexinit: Array[U8] val, our_role: SshRole): Bool =>
+    """
+    True if the peer's KEXINIT advertised the strict-KEX marker for its role.
+    We always advertise ours, so — since strict KEX requires both sides — this
+    is exactly whether strict KEX is in effect for the connection.
+    """
+    let peer_marker =
+      match our_role
+      | SshRoleClient => server_marker()
+      | SshRoleServer => client_marker()
+      end
+    try
+      match SshMessages.decode_kexinit(their_kexinit)?
+      | let prefs: SshAlgorithmPreferences val =>
+        for name in prefs.kex.values() do
+          if name == peer_marker then return true end
+        end
+        false
+      | None => false
+      end
+    else
+      false
+    end
+
 primitive SshDefaultAlgorithms
   fun preferences(): SshAlgorithmPreferences val =>
     """
