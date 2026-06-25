@@ -53,6 +53,7 @@ primitive \nodoc\ Tests is TestList
     test(_TestEncryptedPacketCorrupted)
     test(_TestEncryptedPacketLargePayload)
     test(_TestChacha20Poly1305Roundtrip)
+    test(_TestChacha20Poly1305KnownAnswer)
     test(_TestChacha20Poly1305SequenceNumberMatters)
     test(_TestChacha20Poly1305Corrupted)
     test(_TestChachaPacketRoundtrip)

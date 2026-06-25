@@ -42,6 +42,12 @@ All notable changes to this project will be documented in this file. This projec
 - `SshServerConfig` validates the host key when constructed, so an unparseable
   key fails at setup rather than silently dropping every connection at key
   exchange.
+- `chacha20-poly1305@openssh.com` now interoperates with OpenSSH. It was
+  implemented on OpenSSL's IETF `EVP_chacha20_poly1305` AEAD, a different
+  construction from the OpenSSH variant (separate length key, length keystream
+  at block counter 0, payload at counter 1, Poly1305 over the raw
+  encrypted length+payload), so it only ever talked to itself. It is now built
+  from raw ChaCha20 plus a standalone Poly1305, verified against OpenSSH 9.6.
 - Strict key exchange (the OpenSSH `kex-strict-{c,s}-v00@openssh.com`
   extension) is now implemented, mitigating the Terrapin prefix-truncation
   attack (CVE-2023-48795). When the peer also supports it, packet sequence
