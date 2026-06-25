@@ -43,15 +43,33 @@ primitive SshMessages
     w.write_u32(sequence_number)
     w.val_bytes()
 
-  fun kexinit(prefs: SshAlgorithmPreferences val, cookie: Array[U8] val): Array[U8] val =>
-    """Encode SSH_MSG_KEXINIT per RFC 4253 section 7.1."""
+  fun kexinit(prefs: SshAlgorithmPreferences val, cookie: Array[U8] val,
+    kex_extra: (String val | None) = None): Array[U8] val
+  =>
+    """
+    Encode SSH_MSG_KEXINIT per RFC 4253 section 7.1. When kex_extra is set, it
+    is appended to the kex name-list as a trailing extension marker (the
+    strict-KEX pseudo-algorithm, which must appear only in the first KEXINIT).
+    Appending it last keeps it from ever winning negotiation.
+    """
     let w = SshWireWriter
     w.write_byte(SshMsgTypes.kexinit())
     // 16 bytes cookie
     for b in cookie.values() do w.write_byte(b) end
     // 10 name-lists: kex, host_key, cipher_c2s, cipher_s2c, mac_c2s, mac_s2c,
     //                compression_c2s, compression_s2c, languages_c2s, languages_s2c
-    w.write_name_list(prefs.kex)
+    let kex_names =
+      match kex_extra
+      | let marker: String val =>
+        recover val
+          let a = Array[String val](prefs.kex.size() + 1)
+          for n in prefs.kex.values() do a.push(n) end
+          a.push(marker)
+          a
+        end
+      | None => prefs.kex
+      end
+    w.write_name_list(kex_names)
     w.write_name_list(prefs.host_key)
     w.write_name_list(prefs.cipher_client_to_server)
     w.write_name_list(prefs.cipher_server_to_client)

@@ -42,9 +42,22 @@ All notable changes to this project will be documented in this file. This projec
 - `SshServerConfig` validates the host key when constructed, so an unparseable
   key fails at setup rather than silently dropping every connection at key
   exchange.
+- Strict key exchange (the OpenSSH `kex-strict-{c,s}-v00@openssh.com`
+  extension) is now implemented, mitigating the Terrapin prefix-truncation
+  attack (CVE-2023-48795). When the peer also supports it, packet sequence
+  numbers reset at every `SSH_MSG_NEWKEYS` and no non-key-exchange packets are
+  tolerated during the initial key exchange.
+- A peer flooding `SSH_MSG_CHANNEL_OPEN` can no longer grow channel state
+  without bound. Servers cap the number of concurrent channels (rejecting
+  further opens with `SSH_OPEN_RESOURCE_SHORTAGE`), and clients — which have no
+  channel-authorization callback and so would otherwise orphan the state
+  forever — reject inbound channel opens without allocating.
 
 ### Added
 
+- Client channel requests: `SshSession.channel_request_exec` (run a command)
+  and `channel_request_shell` (start a login shell), so a client can drive the
+  canonical SSH workflow rather than only sending raw channel data.
 - `chacha20-poly1305@openssh.com` transport encryption.
 - `SshPublicKeyVerifier`, which verifies a client publickey userauth signature
   against an established session id.

@@ -1,5 +1,6 @@
 use "pony_test"
 use "../ssh_connection"
+use "../ssh_transport"
 use "../ssh_error"
 
 class iso _TestChannelOpenAndConfirm is UnitTest
@@ -117,4 +118,69 @@ class iso _TestChannelFindByRemoteId is UnitTest
     match mgr.find_by_remote_id(999)
     | let found: U32 => h.fail("expected None for unknown remote_id 999")
     | None => None
+    end
+
+class iso _TestChannelCapacity is UnitTest
+  """
+  at_capacity() reports false below the concurrent-channel cap and true once it
+  is reached, so the session can reject further CHANNEL_OPENs before allocating
+  state (the bound that stops a CHANNEL_OPEN-flood memory DoS).
+  """
+  fun name(): String => "ssh_channel/capacity_cap"
+
+  fun apply(h: TestHelper) =>
+    let mgr: SshChannelManager ref = SshChannelManager
+    h.assert_false(mgr.at_capacity())
+
+    var i: USize = 0
+    while i < SshChannelLimits.max_concurrent() do
+      mgr.accept_channel(0, i.u32(), 0x100000, 0x8000, "session")
+      // Capacity must not be reported until the final accept brings us to the
+      // cap, or the session would reject a legal channel one short of the limit.
+      if (i + 1) < SshChannelLimits.max_concurrent() then
+        h.assert_false(mgr.at_capacity())
+      end
+      i = i + 1
+    end
+
+    h.assert_eq[USize](SshChannelLimits.max_concurrent(), mgr.channel_count())
+    h.assert_true(mgr.at_capacity())
+
+class iso _TestChannelRequestExecEncode is UnitTest
+  """
+  The exec channel-request encoder lays out the exact RFC 4254 §6.5 wire
+  fields a client uses to run a command.
+  """
+  fun name(): String => "ssh_channel/request_exec_encode"
+
+  fun apply(h: TestHelper) =>
+    let msg = SshChannelMessages.channel_request_exec(7, "ls -l", true)
+    try
+      let r = SshWireReader(msg)
+      h.assert_eq[U8](SshChannelMsgTypes.channel_request(), r.read_byte()?)
+      h.assert_eq[U32](7, r.read_u32()?)
+      h.assert_eq[String val]("exec", r.read_string_as_str()?)
+      h.assert_eq[Bool](true, r.read_bool()?)
+      h.assert_eq[String val]("ls -l", r.read_string_as_str()?)
+    else
+      h.fail("could not decode exec request")
+    end
+
+class iso _TestChannelRequestShellEncode is UnitTest
+  """
+  The shell channel-request encoder lays out the exact RFC 4254 §6.5 wire
+  fields a client uses to start a login shell.
+  """
+  fun name(): String => "ssh_channel/request_shell_encode"
+
+  fun apply(h: TestHelper) =>
+    let msg = SshChannelMessages.channel_request_shell(3, false)
+    try
+      let r = SshWireReader(msg)
+      h.assert_eq[U8](SshChannelMsgTypes.channel_request(), r.read_byte()?)
+      h.assert_eq[U32](3, r.read_u32()?)
+      h.assert_eq[String val]("shell", r.read_string_as_str()?)
+      h.assert_eq[Bool](false, r.read_bool()?)
+    else
+      h.fail("could not decode shell request")
     end

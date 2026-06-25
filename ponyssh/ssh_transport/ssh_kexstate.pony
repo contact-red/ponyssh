@@ -7,13 +7,18 @@ class SshKexStateMachine
   new create(role: SshRole) =>
     _role = role
 
-  fun ref generate_kexinit(prefs: SshAlgorithmPreferences val): Array[U8] val ? =>
+  fun ref generate_kexinit(prefs: SshAlgorithmPreferences val,
+    include_strict_marker: Bool = false): Array[U8] val ?
+  =>
     """
     Generate our SSH_MSG_KEXINIT payload with a random 16-byte cookie. Errors
-    if the CSPRNG fails.
+    if the CSPRNG fails. When include_strict_marker is set (only the first
+    KEXINIT of a connection), the strict-KEX marker for our role is advertised.
     """
     let cookie = SshRandom.random_bytes(16)?
-    SshMessages.kexinit(prefs, consume cookie)
+    let marker: (String val | None) =
+      if include_strict_marker then SshStrictKex.our_marker(_role) else None end
+    SshMessages.kexinit(prefs, consume cookie, marker)
 
   fun ref receive_kexinit(their_payload: Array[U8] val,
     our_prefs: SshAlgorithmPreferences val):
