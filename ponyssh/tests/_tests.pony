@@ -42,7 +42,6 @@ primitive \nodoc\ Tests is TestList
     test(_TestChannelOpenAndConfirm)
     test(_TestChannelDataSendWindowTracking)
     test(_TestChannelClose)
-    test(_TestChannelFindByRemoteId)
     test(_TestChannelCapacity)
     test(_TestChannelRequestExecEncode)
     test(_TestChannelRequestShellEncode)
@@ -84,6 +83,9 @@ primitive \nodoc\ Tests is TestList
     test(_TestPtyIcrnlDisabledByZeroValue)
     test(_TestPtyModeParseRoundtrip)
     test(_TestPtyModeParseEmpty)
+    test(_TestWireStringRejectsOversizedLength)
+    test(_TestMpintCanonicalStripsLeadingZeros)
+    test(_TestRandomBytesSucceedsAndDiffers)
 
 class iso _TestErrorStrings is UnitTest
   fun name(): String => "ssh_error/error_strings"

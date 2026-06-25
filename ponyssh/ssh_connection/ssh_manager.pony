@@ -19,6 +19,16 @@ primitive SshChannelLimits
     256
 
 class SshChannelManager
+  """
+  Tracks channel state keyed by local channel id. The local id (the map key) is
+  the value we advertise to the peer as `sender_channel`; the peer echoes it
+  back as the `recipient_channel` of every message it sends us, so the
+  connection layer uses an inbound `recipient_channel` directly as the local
+  key. A channel's `remote_id` is stored only to fill the `recipient_channel`
+  field of messages we send to the peer. Anyone changing how outbound messages
+  are keyed must preserve this local-id == map-key == peer's recipient_channel
+  invariant, or inbound routing will look up the wrong channel.
+  """
   var _next_local_id: U32 = 0
   let _channels: Map[U32, SshChannelState] = Map[U32, SshChannelState]
 
@@ -109,22 +119,20 @@ class SshChannelManager
     end
 
   fun ref window_adjust(local_id: U32, bytes: U32) =>
-    """Increase remote window for channel."""
+    """
+    Increase the remote send window for a channel. Saturates at U32 max rather
+    than wrapping: a peer that sums WINDOW_ADJUSTs past 2^32 (which RFC 4254
+    §5.2 forbids) must not silently wrap our window back to a small value.
+    """
     try
       let ch = _channels(local_id)?
-      ch.remote_window = ch.remote_window + bytes
+      (let sum, let overflow) = ch.remote_window.addc(bytes)
+      ch.remote_window = if overflow then U32.max_value() else sum end
     end
 
   fun ref close_channel(local_id: U32) =>
     """Remove channel state."""
     try _channels.remove(local_id)? end
-
-  fun ref find_by_remote_id(remote_id: U32): (U32 | None) =>
-    """Find local ID for a remote channel ID."""
-    for (local_id, ch) in _channels.pairs() do
-      if ch.remote_id == remote_id then return local_id end
-    end
-    None
 
   fun ref get(local_id: U32): (SshChannelState ref | None) =>
     try _channels(local_id)? else None end
