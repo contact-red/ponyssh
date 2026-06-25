@@ -98,43 +98,6 @@ class ref SshCipherContext
     end
     @EVP_CIPHER_CTX_set_padding(ctx, 0)
 
-  new ref chacha20_poly1305_raw(
-    key: Array[U8] val,
-    nonce: Array[U8] val,
-    encrypting: Bool)
-    ?
-  =>
-    """ChaCha20-Poly1305 with explicit key and nonce (8 or 12 bytes)."""
-    _encrypting = encrypting
-    _tag = None
-    let ctx = @EVP_CIPHER_CTX_new()
-    if ctx.is_null() then error end
-    _ctx = ctx
-    // OpenSSL expects 12-byte IV; SSH uses 8-byte nonce — pad to 12
-    let iv = if nonce.size() == 8 then
-      recover val
-        let n = Array[U8].init(0, 12)
-        n(4)? = nonce(0)?; n(5)? = nonce(1)?
-        n(6)? = nonce(2)?; n(7)? = nonce(3)?
-        n(8)? = nonce(4)?; n(9)? = nonce(5)?
-        n(10)? = nonce(6)?; n(11)? = nonce(7)?
-        n
-      end
-    else
-      nonce
-    end
-    let cipher = @EVP_chacha20_poly1305()
-    let rc = if encrypting then
-      @EVP_EncryptInit_ex(ctx, cipher, Pointer[None], key.cpointer(), iv.cpointer())
-    else
-      @EVP_DecryptInit_ex(ctx, cipher, Pointer[None], key.cpointer(), iv.cpointer())
-    end
-    if rc != 1 then
-      @EVP_CIPHER_CTX_free(ctx)
-      _ctx = Pointer[None]
-      error
-    end
-
   fun ref set_aad(aad: Array[U8] val) ? =>
     """
     Set additional authenticated data for AEAD ciphers (GCM).
