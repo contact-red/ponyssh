@@ -46,7 +46,34 @@ use @EVP_aes_256_gcm[Pointer[None] tag]()
 use @EVP_aes_128_gcm[Pointer[None] tag]()
 use @EVP_aes_256_ctr[Pointer[None] tag]()
 use @EVP_aes_128_cbc[Pointer[None] tag]()
-use @EVP_chacha20_poly1305[Pointer[None] tag]()
+use @EVP_chacha20[Pointer[None] tag]()
+
+// Poly1305 via the OpenSSL 3.0 EVP_MAC interface. Used to build the
+// chacha20-poly1305@openssh.com AEAD by hand (OpenSSH's construction differs
+// from the IETF EVP_chacha20_poly1305 AEAD: separate length key, length
+// keystream at block counter 0, payload at counter 1, MAC over the raw
+// encrypted length+payload).
+use @EVP_MAC_fetch[Pointer[None] tag](
+  libctx: Pointer[None] tag,
+  algorithm: Pointer[U8] tag,
+  properties: Pointer[U8] tag)
+use @EVP_MAC_free[None](mac: Pointer[None] tag)
+use @EVP_MAC_CTX_new[Pointer[None] tag](mac: Pointer[None] tag)
+use @EVP_MAC_CTX_free[None](ctx: Pointer[None] tag)
+use @EVP_MAC_init[I32](
+  ctx: Pointer[None] tag,
+  key: Pointer[U8] tag,
+  keylen: USize,
+  params: Pointer[None] tag)
+use @EVP_MAC_update[I32](
+  ctx: Pointer[None] tag,
+  data: Pointer[U8] tag,
+  datalen: USize)
+use @EVP_MAC_final[I32](
+  ctx: Pointer[None] tag,
+  out: Pointer[U8] tag,
+  outl: Pointer[USize] tag,
+  outsize: USize)
 
 // HMAC
 use @HMAC[Pointer[U8] tag](

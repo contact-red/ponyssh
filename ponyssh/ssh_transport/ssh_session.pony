@@ -97,6 +97,12 @@ actor SshSession
   // nonces) a single key sees before the next rekey.
   var _rekey: (SshRekeyContext | None) = None
   var _send_blackout: Bool = false
+  // Strict key exchange (OpenSSH extension, Terrapin / CVE-2023-48795
+  // mitigation). Set true once the peer's first KEXINIT advertises the marker
+  // (we always advertise ours, so this means both sides do). While true the
+  // packet sequence number is reset to zero at every NEWKEYS, and during the
+  // initial key exchange only key-exchange packets are tolerated.
+  var _strict_kex: Bool = false
   let _pending_sends: Array[Array[U8] val] = Array[Array[U8] val]
   var _write_baseline: U32 = 0
   var _read_baseline: U32 = 0
@@ -200,6 +206,38 @@ actor SshSession
         return
       end
       offset = offset + seg_len
+    end
+
+  be channel_request_shell(channel_id: U32, want_reply: Bool = true) =>
+    """
+    Ask the peer to start a login shell on a channel we opened (RFC 4254 §6.5).
+    The channel's output arrives via ssh_channel_data. A no-op unless the
+    session is Connected and the channel exists.
+    """
+    match _state
+    | let _: SshStateConnected =>
+      match _channel_manager.get(channel_id)
+      | let ch: SshChannelState =>
+        _send_packet(SshChannelMessages.channel_request_shell(
+          ch.remote_id, want_reply))
+      end
+    end
+
+  be channel_request_exec(channel_id: U32, command: String val,
+    want_reply: Bool = true)
+  =>
+    """
+    Ask the peer to run a single command on a channel we opened (RFC 4254 §6.5).
+    The command's output arrives via ssh_channel_data. A no-op unless the
+    session is Connected and the channel exists.
+    """
+    match _state
+    | let _: SshStateConnected =>
+      match _channel_manager.get(channel_id)
+      | let ch: SshChannelState =>
+        _send_packet(SshChannelMessages.channel_request_exec(
+          ch.remote_id, command, want_reply))
+      end
     end
 
   be channel_close(channel_id: U32) =>
@@ -396,8 +434,10 @@ actor SshSession
           // Send our KEXINIT and transition to key exchange
           match _kex
           | let kex: SshKexStateMachine =>
+            // The first KEXINIT advertises the strict-KEX marker; rekey
+            // KEXINITs must not (the marker is only valid in the first).
             let our_kexinit =
-              try kex.generate_kexinit(_prefs)?
+              try kex.generate_kexinit(_prefs where include_strict_marker = true)?
               else
                 _disconnect_with_error(SshKexFailed(SshKeyInvalid))
                 return
@@ -434,6 +474,21 @@ actor SshSession
     """Route a decrypted payload to the appropriate handler based on state."""
     try
       let msg_type = payload(0)?
+
+      // Strict KEX (Terrapin / CVE-2023-48795): during the initial key exchange
+      // the only legal packets are key-exchange messages. Anything else — even
+      // IGNORE/DEBUG/UNIMPLEMENTED, which are otherwise always allowed — is an
+      // injection attempt that desynchronises the transcript; tear down. A peer
+      // DISCONNECT is still honoured below. Enforced only once we know the peer
+      // also negotiated strict KEX, and only until the first NEWKEYS brings
+      // encryption up (after which EXT_INFO and the like are legitimate).
+      if _strict_kex and (not _encrypted)
+        and (not _is_kex_message(msg_type))
+        and (msg_type != SshMsgTypes.disconnect())
+      then
+        _disconnect_with_error(SshStrictKexViolation)
+        return
+      end
 
       // Global messages handled in any state (RFC 4253 §11)
       match msg_type
@@ -485,6 +540,9 @@ actor SshSession
         match kex.receive_kexinit(payload, _prefs)
         | let neg: SshNegotiatedAlgorithms val =>
           _context.negotiated_algorithms = neg
+          // Strict KEX is in effect iff the peer also advertised the marker in
+          // this (first) KEXINIT. Detected once, here, during the initial KEX.
+          _strict_kex = SshStrictKex.peer_advertised(payload, _role)
           // Update state with their KEXINIT and negotiated algorithms
           let our_ki = match _our_kexinit
           | let ki: Array[U8] val => ki
@@ -547,6 +605,11 @@ actor SshSession
         end
       end
     | SshMsgTypes.newkeys() =>
+      // Strict KEX: our incoming sequence number resets to zero at the peer's
+      // NEWKEYS (the NEWKEYS packet itself has already been counted), so the
+      // first packet under the new key is parsed at sequence 0. Done before
+      // _activate_encryption so the reader's per-key baseline starts at 0.
+      if _strict_kex then _reader.reset_sequence_number() end
       let session_id = match _context.session_id
       | let id: Array[U8] val => id
       else
@@ -630,6 +693,9 @@ actor SshSession
             _send_packet(SshMessages.kex_ecdh_reply(host_key_blob, server_pub,
               sig_blob))
             _send_packet(SshMessages.newkeys())
+            // Strict KEX: our outgoing sequence number resets to zero at our
+            // NEWKEYS, so the first packet under the new key is sequence 0.
+            if _strict_kex then _writer.reset_sequence_number() end
           | let err: SshCryptoError =>
             _disconnect_with_error(SshKexFailed(err))
           end
@@ -694,6 +760,9 @@ actor SshSession
           | true =>
             // Signature valid, send NEWKEYS immediately
             _send_packet(SshMessages.newkeys())
+            // Strict KEX: our outgoing sequence number resets to zero at our
+            // NEWKEYS, so the first packet under the new key is sequence 0.
+            if _strict_kex then _writer.reset_sequence_number() end
             // Notify consumer for host key verification (accept/reject
             // controls whether auth proceeds after we receive server NEWKEYS)
             s.awaiting_host_key_verification = true
@@ -955,6 +1024,9 @@ actor SshSession
     new key, and end the send-blackout — flushing any deferred packets.
     """
     _send_kex_packet(SshMessages.newkeys())
+    // Strict KEX persists for the connection: reset our outgoing sequence
+    // number at every NEWKEYS, so _install_writer baselines this key at 0.
+    if _strict_kex then _writer.reset_sequence_number() end
     match (rk.derived, rk.negotiated)
     | (let keys: SshDerivedKeys val, let neg: SshNegotiatedAlgorithms val) =>
       if not _install_writer(keys, neg) then return end
@@ -969,6 +1041,9 @@ actor SshSession
 
   fun ref _rekey_recv_newkeys(rk: SshRekeyContext) =>
     """Peer NEWKEYS received: switch our incoming direction to the new key."""
+    // Strict KEX persists for the connection: reset our incoming sequence
+    // number at every NEWKEYS, so _install_reader baselines this key at 0.
+    if _strict_kex then _reader.reset_sequence_number() end
     match (rk.derived, rk.negotiated)
     | (let keys: SshDerivedKeys val, let neg: SshNegotiatedAlgorithms val) =>
       if not _install_reader(keys, neg) then return end
@@ -1367,11 +1442,28 @@ actor SshSession
         let sender_channel = r.read_u32()?
         let initial_window = r.read_u32()?
         let max_packet = r.read_u32()?
-        let local_id = _channel_manager.accept_channel(
-          0, sender_channel, initial_window, max_packet, ch_type)
         match _server_notify
         | let n: SshServerNotify tag =>
-          n.ssh_channel_open_request(this, local_id, ch_type)
+          // Cap the number of concurrent channels before allocating state. A
+          // peer flooding CHANNEL_OPEN would otherwise grow _channels without
+          // bound (each entry advertises a 2 MiB window) — a memory DoS.
+          // RFC 4254 §5.1 reason 4 = SSH_OPEN_RESOURCE_SHORTAGE.
+          if _channel_manager.at_capacity() then
+            _send_packet(SshChannelMessages.channel_open_failure(
+              sender_channel, 4, "too many open channels"))
+          else
+            let local_id = _channel_manager.accept_channel(
+              0, sender_channel, initial_window, max_packet, ch_type)
+            n.ssh_channel_open_request(this, local_id, ch_type)
+          end
+        | None =>
+          // A client never accepts inbound channels. Reject without allocating
+          // state: there is no client-side authorization callback, so an
+          // accepted channel would be orphaned and never removable — a memory
+          // DoS driven by a malicious server. RFC 4254 §5.1 reason 1 =
+          // SSH_OPEN_ADMINISTRATIVELY_PROHIBITED.
+          _send_packet(SshChannelMessages.channel_open_failure(
+            sender_channel, 1, "channels not accepted"))
         end
       end
     | SshChannelMsgTypes.channel_open_confirmation() =>

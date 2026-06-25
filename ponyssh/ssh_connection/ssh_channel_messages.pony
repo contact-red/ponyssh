@@ -72,6 +72,29 @@ primitive SshChannelMessages
     w.write_u32(recipient_channel)
     w.val_bytes()
 
+  fun channel_request_shell(recipient_channel: U32, want_reply: Bool):
+    Array[U8] val
+  =>
+    """Encode a "shell" channel request (RFC 4254 §6.5): start a login shell."""
+    let w = SshWireWriter
+    w.write_byte(SshChannelMsgTypes.channel_request())
+    w.write_u32(recipient_channel)
+    w.write_string_from_str("shell")
+    w.write_bool(want_reply)
+    w.val_bytes()
+
+  fun channel_request_exec(recipient_channel: U32, command: String val,
+    want_reply: Bool): Array[U8] val
+  =>
+    """Encode an "exec" channel request (RFC 4254 §6.5): run a single command."""
+    let w = SshWireWriter
+    w.write_byte(SshChannelMsgTypes.channel_request())
+    w.write_u32(recipient_channel)
+    w.write_string_from_str("exec")
+    w.write_bool(want_reply)
+    w.write_string_from_str(command)
+    w.val_bytes()
+
   fun channel_success(recipient_channel: U32): Array[U8] val =>
     let w = SshWireWriter
     w.write_byte(SshChannelMsgTypes.channel_success())

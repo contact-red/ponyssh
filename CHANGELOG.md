@@ -42,9 +42,28 @@ All notable changes to this project will be documented in this file. This projec
 - `SshServerConfig` validates the host key when constructed, so an unparseable
   key fails at setup rather than silently dropping every connection at key
   exchange.
+- `chacha20-poly1305@openssh.com` now interoperates with OpenSSH. It was
+  implemented on OpenSSL's IETF `EVP_chacha20_poly1305` AEAD, a different
+  construction from the OpenSSH variant (separate length key, length keystream
+  at block counter 0, payload at counter 1, Poly1305 over the raw
+  encrypted length+payload), so it only ever talked to itself. It is now built
+  from raw ChaCha20 plus a standalone Poly1305, verified against OpenSSH 9.6.
+- Strict key exchange (the OpenSSH `kex-strict-{c,s}-v00@openssh.com`
+  extension) is now implemented, mitigating the Terrapin prefix-truncation
+  attack (CVE-2023-48795). When the peer also supports it, packet sequence
+  numbers reset at every `SSH_MSG_NEWKEYS` and no non-key-exchange packets are
+  tolerated during the initial key exchange.
+- A peer flooding `SSH_MSG_CHANNEL_OPEN` can no longer grow channel state
+  without bound. Servers cap the number of concurrent channels (rejecting
+  further opens with `SSH_OPEN_RESOURCE_SHORTAGE`), and clients — which have no
+  channel-authorization callback and so would otherwise orphan the state
+  forever — reject inbound channel opens without allocating.
 
 ### Added
 
+- Client channel requests: `SshSession.channel_request_exec` (run a command)
+  and `channel_request_shell` (start a login shell), so a client can drive the
+  canonical SSH workflow rather than only sending raw channel data.
 - `chacha20-poly1305@openssh.com` transport encryption.
 - `SshPublicKeyVerifier`, which verifies a client publickey userauth signature
   against an established session id.

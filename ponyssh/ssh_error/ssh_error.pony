@@ -54,6 +54,10 @@ primitive SshConnectionLost is Stringable
 primitive SshRekeyUnsupported is Stringable
   fun string(): String iso^ => "rekeying is not supported".clone()
 
+primitive SshStrictKexViolation is Stringable
+  fun string(): String iso^ =>
+    "strict key-exchange violation (unexpected packet during handshake)".clone()
+
 type SshTransportError is
   ( SshPacketTooLarge
   | SshPacketCorrupt
@@ -61,7 +65,8 @@ type SshTransportError is
   | SshAlgorithmNegotiationFailed
   | SshProtocolVersionMismatch
   | SshConnectionLost
-  | SshRekeyUnsupported )
+  | SshRekeyUnsupported
+  | SshStrictKexViolation )
 
 primitive SshAuthRejected is Stringable
   fun string(): String iso^ => "authentication rejected".clone()
