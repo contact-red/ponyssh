@@ -543,6 +543,19 @@ actor SshSession
           // Strict KEX is in effect iff the peer also advertised the marker in
           // this (first) KEXINIT. Detected once, here, during the initial KEX.
           _strict_kex = SshStrictKex.peer_advertised(payload, _role)
+          // When strict KEX is in effect the KEXINIT must be the first binary
+          // packet received; a packet injected before it shifts the transcript
+          // (the pre-KEXINIT half of Terrapin). The guard above this match only
+          // covers packets *after* _strict_kex is known, so close the earlier
+          // window here. Only enforced when both peers negotiated strict KEX, so
+          // a legitimate non-strict peer is unaffected.
+          if _strict_kex
+            and (not SshStrictKex.initial_kexinit_position_ok(
+              _reader.sequence_number()))
+          then
+            _disconnect_with_error(SshStrictKexViolation)
+            return
+          end
           // Update state with their KEXINIT and negotiated algorithms
           let our_ki = match _our_kexinit
           | let ki: Array[U8] val => ki
@@ -1413,10 +1426,21 @@ actor SshSession
           let r = SshWireReader(payload)
           r.read_byte()?  // msg type
           let service = r.read_string_as_str()?
+          // The only service available before authentication is ssh-userauth
+          // (RFC 4253 §10). Reject any other name with a clean disconnect rather
+          // than SERVICE_ACCEPTing an arbitrary service we do not provide.
+          if service != "ssh-userauth" then
+            _disconnect_with_error(SshPacketCorrupt)
+            return
+          end
           let w = SshWireWriter
           w.write_byte(SshAuthMsgTypes.service_accept())
           w.write_string_from_str(service)
           _send_packet(w.val_bytes())
+        else
+          // A truncated SERVICE_REQUEST is a protocol violation; tear down
+          // instead of silently dropping it and leaving the peer waiting.
+          _disconnect_with_error(SshPacketCorrupt)
         end
       end
     end
@@ -1541,52 +1565,74 @@ actor SshSession
         _notify_channel_closed(recipient_channel)
       end
     | SshChannelMsgTypes.channel_request() =>
-      try
-        let r = SshWireReader(payload)
-        r.read_byte()?  // msg type
-        let recipient_channel = r.read_u32()?
-        let request_type = r.read_string_as_str()?
-        let want_reply = r.read_bool()?
-        if _channel_manager.get(recipient_channel) is None then error end
-        match _server_notify
-        | let n: SshServerNotify tag =>
-          if request_type == "pty-req" then
-            let term = r.read_string_as_str()?
-            let width_chars = r.read_u32()?
-            let height_rows = r.read_u32()?
-            let width_pixels = r.read_u32()?
-            let height_pixels = r.read_u32()?
-            let mode_data = r.read_string()?
-            let modes = SshTerminalModes.parse_modes(mode_data)?
-            let pty = SshPtyState(term, width_chars, height_rows,
-              width_pixels, height_pixels, modes)
-            // Store optimistically; mark pending until accept/reject
-            match _channel_manager.get(recipient_channel)
-            | let ch: SshChannelState =>
-              ch.pty = pty
-              ch.pty_pending = true
-            end
-            n.ssh_pty_request(this, recipient_channel, pty, want_reply)
-          elseif request_type == "shell" then
-            n.ssh_shell_request(this, recipient_channel, want_reply)
-          elseif request_type == "window-change" then
-            let width_chars = r.read_u32()?
-            let height_rows = r.read_u32()?
-            let width_pixels = r.read_u32()?
-            let height_pixels = r.read_u32()?
-            match _channel_manager.get(recipient_channel)
-            | let ch: SshChannelState =>
-              match ch.pty
-              | let old_pty: SshPtyState val =>
-                ch.pty = SshPtyState.with_dimensions(old_pty,
+      let r = SshWireReader(payload)
+      // Parse the fixed header first. If even this fails we do not know which
+      // channel to answer, so the packet is simply dropped.
+      let header =
+        try
+          r.read_byte()?  // msg type
+          (r.read_u32()?, r.read_string_as_str()?, r.read_bool()?)
+        end
+      match header
+      | (let recipient_channel: U32, let request_type: String val,
+         let want_reply: Bool) =>
+        if _channel_manager.get(recipient_channel) is None then return end
+        // Parse and dispatch the request-specific body. A truncated body errors
+        // out of this try and leaves dispatched = false.
+        let dispatched =
+          try
+            match _server_notify
+            | let n: SshServerNotify tag =>
+              if request_type == "pty-req" then
+                let term = r.read_string_as_str()?
+                let width_chars = r.read_u32()?
+                let height_rows = r.read_u32()?
+                let width_pixels = r.read_u32()?
+                let height_pixels = r.read_u32()?
+                let mode_data = r.read_string()?
+                let modes = SshTerminalModes.parse_modes(mode_data)?
+                let pty = SshPtyState(term, width_chars, height_rows,
+                  width_pixels, height_pixels, modes)
+                // Store optimistically; mark pending until accept/reject
+                match _channel_manager.get(recipient_channel)
+                | let ch: SshChannelState =>
+                  ch.pty = pty
+                  ch.pty_pending = true
+                end
+                n.ssh_pty_request(this, recipient_channel, pty, want_reply)
+              elseif request_type == "shell" then
+                n.ssh_shell_request(this, recipient_channel, want_reply)
+              elseif request_type == "window-change" then
+                let width_chars = r.read_u32()?
+                let height_rows = r.read_u32()?
+                let width_pixels = r.read_u32()?
+                let height_pixels = r.read_u32()?
+                match _channel_manager.get(recipient_channel)
+                | let ch: SshChannelState =>
+                  match ch.pty
+                  | let old_pty: SshPtyState val =>
+                    ch.pty = SshPtyState.with_dimensions(old_pty,
+                      width_chars, height_rows, width_pixels, height_pixels)
+                  end
+                end
+                n.ssh_window_change(this, recipient_channel,
                   width_chars, height_rows, width_pixels, height_pixels)
+              else
+                n.ssh_channel_request(this, recipient_channel, request_type,
+                  want_reply)
               end
             end
-            n.ssh_window_change(this, recipient_channel,
-              width_chars, height_rows, width_pixels, height_pixels)
+            true
           else
-            n.ssh_channel_request(this, recipient_channel, request_type,
-              want_reply)
+            false
+          end
+        // A malformed request body that asked for a reply must still get a
+        // CHANNEL_FAILURE, or the peer blocks waiting for a response that the
+        // silently-dropped request would never produce.
+        if (not dispatched) and want_reply then
+          match _channel_manager.get(recipient_channel)
+          | let ch: SshChannelState =>
+            _send_packet(SshChannelMessages.channel_failure(ch.remote_id))
           end
         end
       end
@@ -1594,6 +1640,12 @@ actor SshSession
     | SshChannelMsgTypes.channel_failure() => None
     | SshMsgTypes.disconnect() =>
       _peer_disconnected()
+    else
+      // RFC 4253 §11.4: respond to an unrecognized message with
+      // SSH_MSG_UNIMPLEMENTED carrying the receive sequence number of the
+      // offending packet. The reader has already advanced past it, so that
+      // packet's number is one less than the reader's current sequence number.
+      _send_packet(SshMessages.unimplemented(_reader.sequence_number() - 1))
     end
 
   fun ref _send_packet(payload: Array[U8] val) =>

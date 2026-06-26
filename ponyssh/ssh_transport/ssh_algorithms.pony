@@ -166,6 +166,17 @@ primitive SshStrictKex
     | SshRoleServer => server_marker()
     end
 
+  fun initial_kexinit_position_ok(reader_sequence_after_read: U32): Bool =>
+    """
+    Under strict KEX the peer's KEXINIT must be the very first binary packet of
+    the connection. The reader increments its sequence number as each packet is
+    read, so when we process that KEXINIT the reader's sequence number is exactly
+    1 if nothing preceded it. A larger value means a packet was injected before
+    the KEXINIT (e.g. an SSH_MSG_IGNORE) — the pre-KEXINIT half of the Terrapin
+    attack (CVE-2023-48795) — and the connection must abort.
+    """
+    reader_sequence_after_read == 1
+
   fun peer_advertised(their_kexinit: Array[U8] val, our_role: SshRole): Bool =>
     """
     True if the peer's KEXINIT advertised the strict-KEX marker for its role.
