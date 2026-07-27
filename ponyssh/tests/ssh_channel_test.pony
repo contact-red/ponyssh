@@ -68,13 +68,14 @@ class iso _TestChannelDataQueuedAcrossWindowAdjust is UnitTest
     mgr.window_adjust(local_id, 10)
     match mgr.next_channel_data(local_id)
     | let s: SshChannelDataSegment val =>
-      h.assert_array_eq[U8]("ef".array(), s.data)
-    else h.fail("expected retained suffix after window adjustment")
+      h.assert_array_eq[U8]("efg".array(), s.data)
+    else h.fail("expected FIFO segment spanning queued writes")
     end
+    h.assert_eq[USize](1, mgr.pending_send_bytes(local_id))
     match mgr.next_channel_data(local_id)
     | let s: SshChannelDataSegment val =>
-      h.assert_array_eq[U8]("gh".array(), s.data)
-    else h.fail("expected second write after retained suffix")
+      h.assert_array_eq[U8]("h".array(), s.data)
+    else h.fail("expected remaining FIFO suffix")
     end
     h.assert_eq[USize](0, mgr.pending_send_bytes(local_id))
 
@@ -107,6 +108,13 @@ class iso _TestChannelSendQueueBound is UnitTest
     | let e: SshChannelError => h.fail("capacity was not reclaimed: " + e.string())
     end
     h.assert_eq[USize](3, mgr.pending_send_bytes(local_id))
+    mgr.window_adjust(local_id, 3)
+    match mgr.next_channel_data(local_id)
+    | let s: SshChannelDataSegment val =>
+      h.assert_array_eq[U8]("cde".array(), s.data)
+    else h.fail("expected FIFO data after capacity reclamation")
+    end
+    h.assert_eq[USize](0, mgr.pending_send_bytes(local_id))
 
 class iso _TestChannelClose is UnitTest
   fun name(): String => "ssh_channel/close"
