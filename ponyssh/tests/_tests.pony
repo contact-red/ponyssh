@@ -40,7 +40,8 @@ primitive \nodoc\ Tests is TestList
     test(_TestAuthStateMachineTriesMethods)
     test(_TestAuthFailureDecode)
     test(_TestChannelOpenAndConfirm)
-    test(_TestChannelDataSendWindowTracking)
+    test(_TestChannelDataQueuedAcrossWindowAdjust)
+    test(_TestChannelSendQueueBound)
     test(_TestChannelClose)
     test(_TestChannelCapacity)
     test(_TestChannelRequestExecEncode)
@@ -76,6 +77,7 @@ primitive \nodoc\ Tests is TestList
     test(_TestIntegrationPubkeyAuth)
     test(_TestIntegrationHostKeyReject)
     test(_TestIntegrationRekey)
+    test(_TestIntegrationChannelFlowControl)
     test(_TestPtyIcrnlLoneCr)
     test(_TestPtyIcrnlPreservesCrLf)
     test(_TestPtyIcrnlLoneCrReplaced)
@@ -103,6 +105,7 @@ class iso _TestErrorStrings is UnitTest
     h.assert_true(SshAuthRejected.string().size() > 0)
     h.assert_true(SshChannelClosed.string().size() > 0)
     h.assert_true(SshWindowExhausted.string().size() > 0)
+    h.assert_true(SshSendQueueFull.string().size() > 0)
 
     // Wrapping errors preserve inner context
     let inner: SshCryptoError = SshDecryptFailed

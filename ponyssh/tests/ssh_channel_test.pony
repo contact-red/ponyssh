@@ -29,50 +29,84 @@ class iso _TestChannelOpenAndConfirm is UnitTest
     | None => h.fail("channel not found after confirm")
     end
 
-class iso _TestChannelDataSendWindowTracking is UnitTest
-  fun name(): String => "ssh_channel/data_send_window_tracking"
+class iso _TestChannelDataQueuedAcrossWindowAdjust is UnitTest
+  fun name(): String => "ssh_channel/data_queued_across_window_adjust"
 
   fun apply(h: TestHelper) =>
     var mgr: SshChannelManager ref = SshChannelManager
     let local_id = mgr.open_channel("session")
-    mgr.confirm_channel(local_id, 10, 100, 0x8000)
+    mgr.confirm_channel(local_id, 10, 4, 3)
 
-    // Send 50 bytes — should succeed, window goes from 100 to 50
-    match mgr.channel_data_send(local_id, 50)
-    | let remote_id: U32 =>
-      h.assert_eq[U32](10, remote_id)
+    match mgr.queue_channel_data(local_id, "abcdef".array())
+    | None => None
     | let e: SshChannelError =>
-      h.fail("expected remote_id, got error: " + e.string())
+      h.fail("could not queue first write: " + e.string())
     end
-
-    match mgr.get(local_id)
-    | let ch: SshChannelState => h.assert_eq[U32](50, ch.remote_window)
-    | None => h.fail("channel not found")
-    end
-
-    // Send 60 bytes — should fail with SshWindowExhausted (window is 50)
-    match mgr.channel_data_send(local_id, 60)
-    | let remote_id: U32 => h.fail("expected SshWindowExhausted, got remote_id")
-    | SshWindowExhausted => None
+    match mgr.queue_channel_data(local_id, "gh".array())
+    | None => None
     | let e: SshChannelError =>
-      h.fail("expected SshWindowExhausted, got: " + e.string())
+      h.fail("could not queue second write: " + e.string())
     end
 
-    // Window adjust +100 brings remote_window to 150
-    mgr.window_adjust(local_id, 100)
-
-    match mgr.get(local_id)
-    | let ch: SshChannelState => h.assert_eq[U32](150, ch.remote_window)
-    | None => h.fail("channel not found")
+    match mgr.next_channel_data(local_id)
+    | let s: SshChannelDataSegment val =>
+      h.assert_eq[U32](10, s.remote_id)
+      h.assert_array_eq[U8]("abc".array(), s.data)
+    else h.fail("expected first packet-sized segment")
+    end
+    match mgr.next_channel_data(local_id)
+    | let s: SshChannelDataSegment val =>
+      h.assert_array_eq[U8]("d".array(), s.data)
+    else h.fail("expected window-bounded segment")
+    end
+    h.assert_eq[USize](4, mgr.pending_send_bytes(local_id))
+    match mgr.next_channel_data(local_id)
+    | None => None
+    else h.fail("expected flow control to pause delivery")
     end
 
-    // Now send 60 bytes — should succeed
-    match mgr.channel_data_send(local_id, 60)
-    | let remote_id: U32 =>
-      h.assert_eq[U32](10, remote_id)
-    | let e: SshChannelError =>
-      h.fail("expected remote_id after window adjust, got: " + e.string())
+    mgr.window_adjust(local_id, 10)
+    match mgr.next_channel_data(local_id)
+    | let s: SshChannelDataSegment val =>
+      h.assert_array_eq[U8]("ef".array(), s.data)
+    else h.fail("expected retained suffix after window adjustment")
     end
+    match mgr.next_channel_data(local_id)
+    | let s: SshChannelDataSegment val =>
+      h.assert_array_eq[U8]("gh".array(), s.data)
+    else h.fail("expected second write after retained suffix")
+    end
+    h.assert_eq[USize](0, mgr.pending_send_bytes(local_id))
+
+class iso _TestChannelSendQueueBound is UnitTest
+  fun name(): String => "ssh_channel/send_queue_bound"
+
+  fun apply(h: TestHelper) =>
+    var mgr: SshChannelManager ref = SshChannelManager(4)
+    let local_id = mgr.open_channel("session")
+    mgr.confirm_channel(local_id, 10, 0, 3)
+
+    match mgr.queue_channel_data(local_id, "abcd".array())
+    | None => None
+    | let e: SshChannelError => h.fail("could not fill queue: " + e.string())
+    end
+    match mgr.queue_channel_data(local_id, "e".array())
+    | SshSendQueueFull => None
+    else h.fail("expected an atomic queue-capacity error")
+    end
+    h.assert_eq[USize](4, mgr.pending_send_bytes(local_id))
+
+    mgr.window_adjust(local_id, 2)
+    match mgr.next_channel_data(local_id)
+    | let s: SshChannelDataSegment val =>
+      h.assert_array_eq[U8]("ab".array(), s.data)
+    else h.fail("expected queued prefix")
+    end
+    match mgr.queue_channel_data(local_id, "e".array())
+    | None => None
+    | let e: SshChannelError => h.fail("capacity was not reclaimed: " + e.string())
+    end
+    h.assert_eq[USize](3, mgr.pending_send_bytes(local_id))
 
 class iso _TestChannelClose is UnitTest
   fun name(): String => "ssh_channel/close"
@@ -88,11 +122,11 @@ class iso _TestChannelClose is UnitTest
 
     h.assert_eq[USize](0, mgr.channel_count())
 
-    match mgr.channel_data_send(local_id, 10)
-    | let remote_id: U32 => h.fail("expected SshChannelClosed, got remote_id")
+    match mgr.queue_channel_data(local_id, "closed".array())
     | SshChannelClosed => None
     | let e: SshChannelError =>
       h.fail("expected SshChannelClosed, got: " + e.string())
+    | None => h.fail("expected SshChannelClosed")
     end
 
 class iso _TestChannelCapacity is UnitTest

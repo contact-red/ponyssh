@@ -160,52 +160,29 @@ actor SshSession
     end
 
   be channel_send(channel_id: U32, data: Array[U8] val) =>
+    """
+    Queue a whole value for FIFO delivery. Flow control may delay delivery;
+    queue-capacity or channel errors are reported through ssh_channel_error.
+    """
     match _state
-    | let _: SshStateConnected => _channel_send_segmented(channel_id, data)
+    | let _: SshStateConnected =>
+      match _channel_manager.queue_channel_data(channel_id, data)
+      | None => _drain_channel(channel_id)
+      | let err: SshChannelError => _notify_channel_error(channel_id, err)
+      end
     end
 
-  fun ref _channel_send_segmented(channel_id: U32, data: Array[U8] val) =>
-    """
-    Split outbound channel data into packets no larger than the peer's
-    advertised max_packet_size (and no larger than its remaining send window),
-    rather than emitting one oversized CHANNEL_DATA a conformant peer rejects.
-    """
-    let max_packet = match _channel_manager.get(channel_id)
-      | let ch: SshChannelState =>
-        let m = ch.max_packet_size.usize()
-        if m == 0 then 32768 else m end
-      | None =>
-        _notify_channel_error(channel_id, SshChannelClosed)
-        return
-      end
-    var offset: USize = 0
-    while offset < data.size() do
-      let window = match _channel_manager.get(channel_id)
-        | let ch: SshChannelState => ch.remote_window.usize()
-        | None =>
-          _notify_channel_error(channel_id, SshChannelClosed)
-          return
-        end
-      if window == 0 then
-        // The peer's send window is exhausted; the remainder cannot go out
-        // until it grants more via CHANNEL_WINDOW_ADJUST.
-        _notify_channel_error(channel_id, SshWindowExhausted)
-        return
-      end
-      let seg_len = (data.size() - offset).min(max_packet).min(window)
-      let segment = recover val
-        let b = Array[U8].create(seg_len)
-        b.copy_from(data, offset, 0, seg_len)
-        b
-      end
-      match _channel_manager.channel_data_send(channel_id, seg_len)
-      | let remote_id: U32 =>
-        _send_packet(SshChannelMessages.channel_data(remote_id, segment))
+  fun ref _drain_channel(channel_id: U32) =>
+    while true do
+      match _channel_manager.next_channel_data(channel_id)
+      | let segment: SshChannelDataSegment val =>
+        _send_packet(SshChannelMessages.channel_data(
+          segment.remote_id, segment.data))
       | let err: SshChannelError =>
         _notify_channel_error(channel_id, err)
         return
+      | None => return
       end
-      offset = offset + seg_len
     end
 
   be channel_request_shell(channel_id: U32, want_reply: Bool = true) =>
@@ -243,7 +220,7 @@ actor SshSession
   be channel_close(channel_id: U32) =>
     match _state
     | let _: SshStateConnected =>
-      match _channel_manager.channel_data_send(channel_id, 0)
+      match _channel_manager.remote_channel_id(channel_id)
       | let remote_id: U32 =>
         _send_packet(SshChannelMessages.channel_eof(remote_id))
         _send_packet(SshChannelMessages.channel_close(remote_id))
@@ -1552,6 +1529,7 @@ actor SshSession
         let recipient_channel = r.read_u32()?
         let bytes_to_add = r.read_u32()?
         _channel_manager.window_adjust(recipient_channel, bytes_to_add)
+        _drain_channel(recipient_channel)
       end
     | SshChannelMsgTypes.channel_eof() =>
       None

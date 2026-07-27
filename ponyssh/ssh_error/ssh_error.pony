@@ -100,7 +100,11 @@ primitive SshChannelClosed is Stringable
 primitive SshWindowExhausted is Stringable
   fun string(): String iso^ => "window exhausted".clone()
 
+primitive SshSendQueueFull is Stringable
+  fun string(): String iso^ => "channel send queue full".clone()
+
 type SshChannelError is
   ( SshChannelOpenFailed
   | SshChannelClosed
-  | SshWindowExhausted )
+  | SshWindowExhausted
+  | SshSendQueueFull )

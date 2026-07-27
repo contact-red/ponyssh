@@ -18,6 +18,24 @@ primitive SshChannelLimits
     """
     256
 
+  fun max_pending_send_bytes(): USize =>
+    """Maximum outbound data retained for one channel while flow-controlled."""
+    0x800000  // 8 MiB
+
+class _SshPendingWrite
+  let data: Array[U8] val
+  var offset: USize = 0
+
+  new create(data': Array[U8] val) => data = data'
+
+class val SshChannelDataSegment
+  let remote_id: U32
+  let data: Array[U8] val
+
+  new val create(remote_id': U32, data': Array[U8] val) =>
+    remote_id = remote_id'
+    data = data'
+
 class SshChannelManager
   """
   Tracks channel state keyed by local channel id. The local id (the map key) is
@@ -31,6 +49,15 @@ class SshChannelManager
   """
   var _next_local_id: U32 = 0
   let _channels: Map[U32, SshChannelState] = Map[U32, SshChannelState]
+  let _pending: Map[U32, Array[_SshPendingWrite ref]] =
+    Map[U32, Array[_SshPendingWrite ref]]
+  let _pending_bytes: Map[U32, USize] = Map[U32, USize]
+  let _max_pending_send_bytes: USize
+
+  new create(
+    max_pending_send_bytes': USize = SshChannelLimits.max_pending_send_bytes())
+  =>
+    _max_pending_send_bytes = max_pending_send_bytes'
 
   fun ref open_channel(channel_type: String val): U32 =>
     """Allocate local channel ID and create pending state."""
@@ -65,16 +92,78 @@ class SshChannelManager
       remote_window, max_packet_size, channel_type)
     id
 
-  fun ref channel_data_send(local_id: U32, data_size: USize):
-    (U32 | SshChannelError)
+  fun ref queue_channel_data(local_id: U32, data: Array[U8] val):
+    (None | SshChannelError)
   =>
-    """Check window allows sending, return remote channel ID. Caller handles framing."""
+    """Retain a whole write for FIFO delivery as remote window becomes available."""
     try
       let ch = _channels(local_id)?
       if not ch.open then return SshChannelClosed end
-      if ch.remote_window < data_size.u32() then return SshWindowExhausted end
-      ch.remote_window = ch.remote_window - data_size.u32()
-      ch.remote_id
+      if data.size() == 0 then return None end
+      let current = try _pending_bytes(local_id)? else 0 end
+      if (data.size() > _max_pending_send_bytes) or
+        (current > (_max_pending_send_bytes - data.size()))
+      then
+        return SshSendQueueFull
+      end
+      let writes = try
+        _pending(local_id)?
+      else
+        let created = Array[_SshPendingWrite ref]
+        _pending(local_id) = created
+        created
+      end
+      writes.push(_SshPendingWrite(data))
+      _pending_bytes(local_id) = current + data.size()
+      None
+    else
+      SshChannelClosed
+    end
+
+  fun ref next_channel_data(local_id: U32):
+    (SshChannelDataSegment val | SshChannelError | None)
+  =>
+    """Remove and return the next window- and packet-bounded queued segment."""
+    try
+      let ch = _channels(local_id)?
+      if not ch.open then return SshChannelClosed end
+      if ch.remote_window == 0 then return None end
+      let writes = _pending(local_id)?
+      let write = writes(0)?
+      let remaining = write.data.size() - write.offset
+      let packet_limit = if ch.max_packet_size == 0 then
+        USize(32768)
+      else
+        ch.max_packet_size.usize()
+      end
+      let segment_size = remaining.min(packet_limit).min(ch.remote_window.usize())
+      let segment = recover val
+        let bytes = Array[U8].create(segment_size)
+        bytes.copy_from(write.data, write.offset, 0, segment_size)
+        bytes
+      end
+      write.offset = write.offset + segment_size
+      ch.remote_window = ch.remote_window - segment_size.u32()
+      let queued = _pending_bytes(local_id)? - segment_size
+      if write.offset == write.data.size() then writes.shift()? end
+      if writes.size() == 0 then
+        _pending.remove(local_id)?
+        _pending_bytes.remove(local_id)?
+      else
+        _pending_bytes(local_id) = queued
+      end
+      SshChannelDataSegment(ch.remote_id, segment)
+    else
+      None
+    end
+
+  fun pending_send_bytes(local_id: U32): USize =>
+    try _pending_bytes(local_id)? else 0 end
+
+  fun remote_channel_id(local_id: U32): (U32 | SshChannelError) =>
+    try
+      let ch = _channels(local_id)?
+      if ch.open then ch.remote_id else SshChannelClosed end
     else
       SshChannelClosed
     end
@@ -133,6 +222,8 @@ class SshChannelManager
   fun ref close_channel(local_id: U32) =>
     """Remove channel state."""
     try _channels.remove(local_id)? end
+    try _pending.remove(local_id)? end
+    try _pending_bytes.remove(local_id)? end
 
   fun ref get(local_id: U32): (SshChannelState ref | None) =>
     try _channels(local_id)? else None end
