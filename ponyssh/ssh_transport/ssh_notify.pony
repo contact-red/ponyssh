@@ -18,6 +18,12 @@ interface SshClientNotify
   be ssh_channel_opened(session: SshSession tag, channel_id: U32)
   be ssh_channel_data(session: SshSession tag, channel_id: U32, data: Array[U8] val)
   be ssh_channel_error(session: SshSession tag, channel_id: U32, err: SshChannelError val)
+  be ssh_channel_writeable(session: SshSession tag, channel_id: U32) => None
+    """
+    A channel whose send queue was full has drained. Only sent to a consumer
+    whose channel_send was refused with SshWindowExhausted, telling it the
+    refused data can now be re-sent.
+    """
   be ssh_channel_closed(session: SshSession tag, channel_id: U32)
   be ssh_error(session: SshSession tag, err: SshTransportError val)
   be ssh_disconnected(session: SshSession tag)
@@ -85,6 +91,12 @@ interface SshServerNotify
     data: Array[U8] val) => None
   be ssh_channel_error(session: SshSession tag, channel_id: U32,
     err: SshChannelError val) => None
+  be ssh_channel_writeable(session: SshSession tag, channel_id: U32) => None
+    """
+    A channel whose send queue was full has drained. Only sent to a consumer
+    whose channel_send was refused with SshWindowExhausted, telling it the
+    refused data can now be re-sent.
+    """
   be ssh_channel_closed(session: SshSession tag, channel_id: U32) => None
   be ssh_error(session: SshSession tag, err: SshTransportError val) => None
   be ssh_disconnected(session: SshSession tag) => None

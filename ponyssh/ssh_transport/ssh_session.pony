@@ -161,51 +161,50 @@ actor SshSession
 
   be channel_send(channel_id: U32, data: Array[U8] val) =>
     match _state
-    | let _: SshStateConnected => _channel_send_segmented(channel_id, data)
+    | let _: SshStateConnected => _channel_send(channel_id, data)
     end
 
-  fun ref _channel_send_segmented(channel_id: U32, data: Array[U8] val) =>
+  fun ref _channel_send(channel_id: U32, data: Array[U8] val) =>
     """
-    Split outbound channel data into packets no larger than the peer's
-    advertised max_packet_size (and no larger than its remaining send window),
-    rather than emitting one oversized CHANNEL_DATA a conformant peer rejects.
+    Queue outbound channel data and send as much of it as flow control allows.
+    The buffer is accepted whole or not at all: when the send queue is full the
+    consumer is told with SshWindowExhausted and nothing is sent, so it never
+    has to work out how much of its buffer went out. Anything the peer's window
+    has no room for yet leaves as the peer grants more.
     """
-    let max_packet = match _channel_manager.get(channel_id)
-      | let ch: SshChannelState =>
-        let m = ch.max_packet_size.usize()
-        if m == 0 then 32768 else m end
-      | None =>
-        _notify_channel_error(channel_id, SshChannelClosed)
-        return
+    match _channel_manager.queue_send(channel_id, data)
+    | let err: SshChannelError =>
+      _notify_channel_error(channel_id, err)
+    else
+      _drain_channel(channel_id)
+    end
+
+  fun ref _drain_channel(channel_id: U32) =>
+    """
+    Send as much queued channel data as the peer's send window and maximum
+    packet size allow, splitting it into conformant CHANNEL_DATA packets. Called
+    when data is queued and again whenever the peer grants window; whatever does
+    not fit stays queued.
+
+    An unknown channel is ignored rather than reported. One caller passes an id
+    taken from a peer's CHANNEL_WINDOW_ADJUST, and surfacing that would let a
+    peer raise channel errors for ids that never existed. A consumer's own send
+    is told about a missing channel by queue_send, before this runs.
+    """
+    let remote_id = match _channel_manager.get(channel_id)
+      | let ch: SshChannelState => ch.remote_id
+      | None => return
       end
-    var offset: USize = 0
-    while offset < data.size() do
-      let window = match _channel_manager.get(channel_id)
-        | let ch: SshChannelState => ch.remote_window.usize()
-        | None =>
-          _notify_channel_error(channel_id, SshChannelClosed)
-          return
-        end
-      if window == 0 then
-        // The peer's send window is exhausted; the remainder cannot go out
-        // until it grants more via CHANNEL_WINDOW_ADJUST.
-        _notify_channel_error(channel_id, SshWindowExhausted)
-        return
-      end
-      let seg_len = (data.size() - offset).min(max_packet).min(window)
-      let segment = recover val
-        let b = Array[U8].create(seg_len)
-        b.copy_from(data, offset, 0, seg_len)
-        b
-      end
-      match _channel_manager.channel_data_send(channel_id, seg_len)
-      | let remote_id: U32 =>
+    var draining = true
+    while draining do
+      match _channel_manager.next_send_segment(channel_id)
+      | let segment: Array[U8] val =>
         _send_packet(SshChannelMessages.channel_data(remote_id, segment))
-      | let err: SshChannelError =>
-        _notify_channel_error(channel_id, err)
-        return
+      | None => draining = false
       end
-      offset = offset + seg_len
+    end
+    if _channel_manager.take_send_unblocked(channel_id) then
+      _notify_channel_writeable(channel_id)
     end
 
   be channel_request_shell(channel_id: U32, want_reply: Bool = true) =>
@@ -245,6 +244,11 @@ actor SshSession
     | let _: SshStateConnected =>
       match _channel_manager.channel_data_send(channel_id, 0)
       | let remote_id: U32 =>
+        // Closing drops anything still waiting on the peer's window. Say so
+        // rather than lose it silently.
+        if _channel_manager.pending_send_bytes(channel_id) > 0 then
+          _notify_channel_error(channel_id, SshChannelClosed)
+        end
         _send_packet(SshChannelMessages.channel_eof(remote_id))
         _send_packet(SshChannelMessages.channel_close(remote_id))
         _channel_manager.close_channel(channel_id)
@@ -1552,6 +1556,8 @@ actor SshSession
         let recipient_channel = r.read_u32()?
         let bytes_to_add = r.read_u32()?
         _channel_manager.window_adjust(recipient_channel, bytes_to_add)
+        // The peer has granted more window; send whatever was waiting on it.
+        _drain_channel(recipient_channel)
       end
     | SshChannelMsgTypes.channel_eof() =>
       None
@@ -1810,6 +1816,14 @@ actor SshSession
     end
     match _server_notify
     | let n: SshServerNotify tag => n.ssh_channel_error(this, channel_id, err)
+    end
+
+  fun ref _notify_channel_writeable(channel_id: U32) =>
+    match _client_notify
+    | let n: SshClientNotify tag => n.ssh_channel_writeable(this, channel_id)
+    end
+    match _server_notify
+    | let n: SshServerNotify tag => n.ssh_channel_writeable(this, channel_id)
     end
 
   fun ref _notify_channel_closed(channel_id: U32) =>

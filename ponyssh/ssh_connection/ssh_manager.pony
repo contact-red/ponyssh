@@ -18,6 +18,16 @@ primitive SshChannelLimits
     """
     256
 
+  fun max_pending_send(): USize =>
+    """
+    Maximum outbound bytes held per channel while waiting on the peer's send
+    window. The queue exists to cover the round trip between exhausting that
+    window and the CHANNEL_WINDOW_ADJUST that reopens it, so it needs to absorb
+    a burst, not a whole transfer. 256 KiB does that while bounding a peer that
+    stops granting window at 64 MiB across the 256-channel cap.
+    """
+    262144
+
 class SshChannelManager
   """
   Tracks channel state keyed by local channel id. The local id (the map key) is
@@ -78,6 +88,91 @@ class SshChannelManager
     else
       SshChannelClosed
     end
+
+  fun ref queue_send(local_id: U32, data: Array[U8] val):
+    (None | SshChannelError)
+  =>
+    """
+    Take outbound channel data, to be drained as the peer's send window allows.
+    All of data is accepted or none of it is: when the queue has no room for the
+    whole buffer the call is rejected with SshWindowExhausted and nothing is
+    queued, so a caller is never left working out how much of its buffer went
+    out. SshChannelClosed means there is no such open channel.
+    """
+    try
+      let ch = _channels(local_id)?
+      if not ch.open then return SshChannelClosed end
+      if data.size() == 0 then return None end
+      if (ch.pending_bytes + data.size()) > SshChannelLimits.max_pending_send()
+      then
+        ch.send_blocked = true
+        return SshWindowExhausted
+      end
+      ch.pending_send.push(data)
+      ch.pending_bytes = ch.pending_bytes + data.size()
+      None
+    else
+      SshChannelClosed
+    end
+
+  fun ref next_send_segment(local_id: U32): (Array[U8] val | None) =>
+    """
+    Take the next segment of queued outbound data that the peer's send window
+    and maximum packet size allow, charging it against the window. The result is
+    a view into the queued buffer, not a copy. None once the queue is empty or
+    the window is full, leaving the remainder to wait for the peer's next
+    CHANNEL_WINDOW_ADJUST.
+    """
+    try
+      let ch = _channels(local_id)?
+      if not ch.open then return None end
+      let head = ch.pending_send.head()?()?
+      let window = ch.remote_window.usize()
+      if window == 0 then return None end
+      let seg_len = head.size().min(_max_packet_size(ch)).min(window)
+      // Charge the window through the one method that owns that accounting.
+      match channel_data_send(local_id, seg_len)
+      | let _: SshChannelError => return None
+      end
+      ch.pending_send.shift()?
+      if seg_len < head.size() then
+        ch.pending_send.unshift(head.trim(seg_len))
+      end
+      ch.pending_bytes = ch.pending_bytes - seg_len
+      head.trim(0, seg_len)
+    else
+      None
+    end
+
+  fun ref take_send_unblocked(local_id: U32): Bool =>
+    """
+    True the once, when a channel whose queue was full has drained empty. The
+    session reports that transition so a consumer whose write was refused knows
+    it may resume; a consumer that never overflowed is never told anything.
+    """
+    try
+      let ch = _channels(local_id)?
+      if ch.send_blocked and (ch.pending_bytes == 0) then
+        ch.send_blocked = false
+        true
+      else
+        false
+      end
+    else
+      false
+    end
+
+  fun pending_send_bytes(local_id: U32): USize =>
+    """Outbound bytes still queued for a channel; 0 if there is no such channel."""
+    try _channels(local_id)?.pending_bytes else 0 end
+
+  fun _max_packet_size(ch: SshChannelState box): USize =>
+    """
+    The peer's maximum packet size, or 32 KiB when it advertised none — sending
+    a larger CHANNEL_DATA than the peer allows is rejected by a conformant peer.
+    """
+    let m = ch.max_packet_size.usize()
+    if m == 0 then 32768 else m end
 
   fun ref channel_data_received(local_id: U32, data_size: USize):
     (U32 | SshChannelError)
