@@ -103,13 +103,13 @@ class SshChannelManager
       let ch = _channels(local_id)?
       if not ch.open then return SshChannelClosed end
       if data.size() == 0 then return None end
-      if (ch.pending_bytes + data.size()) > SshChannelLimits.max_pending_send()
+      if (ch.pending_send.size() + data.size())
+        > SshChannelLimits.max_pending_send()
       then
         ch.send_blocked = true
         return SshWindowExhausted
       end
-      ch.pending_send.push(data)
-      ch.pending_bytes = ch.pending_bytes + data.size()
+      ch.pending_send.append(data)
       None
     else
       SshChannelClosed
@@ -118,28 +118,23 @@ class SshChannelManager
   fun ref next_send_segment(local_id: U32): (Array[U8] val | None) =>
     """
     Take the next segment of queued outbound data that the peer's send window
-    and maximum packet size allow, charging it against the window. The result is
-    a view into the queued buffer, not a copy. None once the queue is empty or
-    the window is full, leaving the remainder to wait for the peer's next
-    CHANNEL_WINDOW_ADJUST.
+    and maximum packet size allow, charging it against the window. None once the
+    queue is empty or the window is full, leaving the remainder to wait for the
+    peer's next CHANNEL_WINDOW_ADJUST.
     """
     try
       let ch = _channels(local_id)?
       if not ch.open then return None end
-      let head = ch.pending_send.head()?()?
+      let queued = ch.pending_send.size()
       let window = ch.remote_window.usize()
-      if window == 0 then return None end
-      let seg_len = head.size().min(_max_packet_size(ch)).min(window)
+      if (queued == 0) or (window == 0) then return None end
+      let seg_len = queued.min(_max_packet_size(ch)).min(window)
       // Charge the window through the one method that owns that accounting.
       match channel_data_send(local_id, seg_len)
       | let _: SshChannelError => return None
       end
-      ch.pending_send.shift()?
-      if seg_len < head.size() then
-        ch.pending_send.unshift(head.trim(seg_len))
-      end
-      ch.pending_bytes = ch.pending_bytes - seg_len
-      head.trim(0, seg_len)
+      // seg_len is bounded by what is queued, so this cannot come up short.
+      ch.pending_send.block(seg_len)?
     else
       None
     end
@@ -152,7 +147,7 @@ class SshChannelManager
     """
     try
       let ch = _channels(local_id)?
-      if ch.send_blocked and (ch.pending_bytes == 0) then
+      if ch.send_blocked and (ch.pending_send.size() == 0) then
         ch.send_blocked = false
         true
       else
@@ -164,7 +159,7 @@ class SshChannelManager
 
   fun pending_send_bytes(local_id: U32): USize =>
     """Outbound bytes still queued for a channel; 0 if there is no such channel."""
-    try _channels(local_id)?.pending_bytes else 0 end
+    try _channels(local_id)?.pending_send.size() else 0 end
 
   fun _max_packet_size(ch: SshChannelState box): USize =>
     """

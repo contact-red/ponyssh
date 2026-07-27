@@ -253,6 +253,44 @@ class iso _TestChannelSendSegmentBounds is UnitTest
       h.assert_array_eq[U8](data, all)
     end
 
+class iso _TestChannelSendCoalescesQueuedWrites is UnitTest
+  """
+  Separate writes are a byte stream, not packet boundaries: one segment may
+  carry the tail of one write and the head of the next, so a caller's framing
+  is never assumed to survive into CHANNEL_DATA packets.
+  """
+  fun name(): String => "ssh_channel/send_coalesces_writes"
+
+  fun apply(h: TestHelper) =>
+    let mgr: SshChannelManager ref = SshChannelManager
+    let id = mgr.open_channel("session")
+    // 16-byte packets against two 10-byte writes: the first segment can only be
+    // full if it draws from both.
+    mgr.confirm_channel(id, 4, 100000, 16)
+
+    let first = _ChannelBytes(10)
+    let second = _ChannelBytes(10)
+    mgr.queue_send(id, first)
+    mgr.queue_send(id, second)
+
+    let segments = _ChannelDrain.segments(mgr, id)
+    h.assert_eq[USize](2, segments.size())
+    try
+      h.assert_eq[USize](16, segments(0)?.size())
+      h.assert_eq[USize](4, segments(1)?.size())
+    else
+      h.fail("expected two segments")
+    end
+
+    let expected = recover iso Array[U8] end
+    expected.append(first)
+    expected.append(second)
+    let joined = recover iso Array[U8] end
+    for seg in segments.values() do
+      joined.append(seg)
+    end
+    h.assert_array_eq[U8](consume expected, consume joined)
+
 class iso _TestChannelSendUnblockedReportedOnce is UnitTest
   """
   The drained-empty signal is raised only for a channel whose write was refused,

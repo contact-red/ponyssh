@@ -4,6 +4,8 @@
 
 Data offered past the window is now held and sent as the peer grants more window. A buffer is accepted whole or not at all: when the queue is full `channel_send` sends none of that buffer and reports `SshWindowExhausted`, so a consumer is never left working out which part of its buffer went out. The queue holds up to 256 KiB per channel.
 
+A channel carries a byte stream, so one `channel_send` is not one packet: a buffer may be split across several, and one packet may carry the end of one buffer and the start of the next. Frame your own messages if the peer needs to see boundaries.
+
 `SshClientNotify` and `SshServerNotify` gained `ssh_channel_writeable`, called when a channel whose queue filled has drained empty. It is called only for a channel whose `channel_send` was refused, so a consumer that never overflows never sees it. Both interfaces supply a default that does nothing, so existing implementations still compile.
 
 ```pony

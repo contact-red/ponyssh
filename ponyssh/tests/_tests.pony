@@ -48,6 +48,7 @@ primitive \nodoc\ Tests is TestList
     test(_TestChannelSendSurvivesWindowExhaustion)
     test(_TestChannelSendQueueAllOrNothing)
     test(_TestChannelSendSegmentBounds)
+    test(_TestChannelSendCoalescesQueuedWrites)
     test(_TestChannelSendUnblockedReportedOnce)
     test(_TestChannelSendQueueRejectsUnknownChannel)
     test(_TestStrictKexPeerAdvertised)
