@@ -58,6 +58,17 @@ primitive SshStrictKexViolation is Stringable
   fun string(): String iso^ =>
     "strict key-exchange violation (unexpected packet during handshake)".clone()
 
+primitive SshUnexpectedMessage is Stringable
+  fun string(): String iso^ =>
+    "unexpected message for the current protocol state".clone()
+
+primitive SshTooManyAuthAttempts is Stringable
+  fun string(): String iso^ => "too many authentication attempts".clone()
+
+primitive SshPendingSendsExceeded is Stringable
+  fun string(): String iso^ =>
+    "deferred send queue exceeded its bound (rekey never completed)".clone()
+
 type SshTransportError is
   ( SshPacketTooLarge
   | SshPacketCorrupt
@@ -66,7 +77,10 @@ type SshTransportError is
   | SshProtocolVersionMismatch
   | SshConnectionLost
   | SshRekeyUnsupported
-  | SshStrictKexViolation )
+  | SshStrictKexViolation
+  | SshUnexpectedMessage
+  | SshTooManyAuthAttempts
+  | SshPendingSendsExceeded )
 
 primitive SshAuthRejected is Stringable
   fun string(): String iso^ => "authentication rejected".clone()

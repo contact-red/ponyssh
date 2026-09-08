@@ -24,6 +24,12 @@ class SshStateKeyExchange
   // approval is still pending, so accept_host_key() knows to start auth.
   var server_newkeys_received: Bool = false
   var our_kex: (SshKexCurve25519 | None) = None
+  // Set once this exchange's ECDH round has been answered, so a repeat of it is
+  // rejected rather than re-run. On the server each KEX_ECDH_INIT costs an
+  // X25519 keygen, a derive and a host-key signature; on the client a second
+  // KEX_ECDH_REPLY would re-derive keys and reset the outgoing sequence number
+  // (the ChaCha20 nonce) under the key already in use.
+  var ecdh_completed: Bool = false
 
   new create(our_kexinit': Array[U8] val, their_kexinit': Array[U8] val,
     negotiated': SshNegotiatedAlgorithms val)

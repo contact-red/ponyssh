@@ -29,6 +29,91 @@ class iso _TestChannelOpenAndConfirm is UnitTest
     | None => h.fail("channel not found after confirm")
     end
 
+class iso _TestChannelMaxPacketSizeClamped is UnitTest
+  """
+  max_packet_size arrives as a peer-controlled uint32 on CHANNEL_OPEN and
+  CHANNEL_OPEN_CONFIRMATION, and it divides our outbound channel data. A peer
+  advertising 1 makes every byte of application output its own SSH packet — 36
+  bytes on the wire and a full AEAD operation per byte, from a single 4-byte
+  field. A peer advertising more than the transport's own packet limit makes us
+  frame packets our own reader would reject. Both ends are clamped when the
+  value is stored, so _channel_send_segmented can divide by it without
+  re-checking.
+  """
+  fun name(): String => "ssh_channel/max_packet_size_clamped"
+
+  fun apply(h: TestHelper) =>
+    // (advertised, expected) — the boundaries are the clamp's own bounds: 256 is
+    // the floor, 32768 the RFC 4253 §6.1 payload every implementation accepts.
+    let cases: Array[(U32, U32)] val =
+      [ (0, 256); (1, 256); (255, 256); (256, 256)
+        (257, 257); (4096, 4096); (32767, 32767); (32768, 32768)
+        (32769, 32768); (100000, 32768); (U32.max_value(), 32768) ]
+
+    for (advertised, expected) in cases.values() do
+      // The accept path: the peer opened the channel and named the value.
+      let accept_mgr: SshChannelManager ref = SshChannelManager
+      let accepted = accept_mgr.accept_channel(0, 7, 0x100000, advertised,
+        "session")
+      match accept_mgr.get(accepted)
+      | let ch: SshChannelState =>
+        h.assert_eq[U32](expected, ch.max_packet_size,
+          "accept_channel did not clamp " + advertised.string())
+      | None => h.fail("accepted channel not found")
+      end
+
+      // The confirm path: we opened the channel and the peer named the value.
+      let confirm_mgr: SshChannelManager ref = SshChannelManager
+      let opened = confirm_mgr.open_channel("session")
+      confirm_mgr.confirm_channel(opened, 7, 0x100000, advertised)
+      match confirm_mgr.get(opened)
+      | let ch: SshChannelState =>
+        h.assert_eq[U32](expected, ch.max_packet_size,
+          "confirm_channel did not clamp " + advertised.string())
+      | None => h.fail("confirmed channel not found")
+      end
+    end
+
+class iso _TestChannelAuthorizedOnlyAfterDecision is UnitTest
+  """
+  A channel the peer asked us to open exists before it is authorized: state is
+  allocated when CHANNEL_OPEN is parsed, but the consumer's accept/reject is an
+  asynchronous behavior and a whole TCP segment is dispatched before it can run.
+  The session refuses requests and data on a channel that is not yet authorized,
+  which depends on accept_channel leaving the flag clear. A channel we opened
+  ourselves is authorized by the peer's CHANNEL_OPEN_CONFIRMATION instead.
+  """
+  fun name(): String => "ssh_channel/authorized_only_after_decision"
+
+  fun apply(h: TestHelper) =>
+    // Inbound: allocated unauthorized, and nothing in the manager grants it.
+    let inbound: SshChannelManager ref = SshChannelManager
+    let accepted = inbound.accept_channel(0, 7, 0x100000, 0x8000, "session")
+    match inbound.get(accepted)
+    | let ch: SshChannelState =>
+      h.assert_false(ch.authorized,
+        "a channel the peer opened must not be authorized before the consumer "
+          + "decides")
+    | None => h.fail("accepted channel not found")
+    end
+
+    // Outbound: ours, and the peer's confirmation is what authorizes it.
+    let outbound: SshChannelManager ref = SshChannelManager
+    let opened = outbound.open_channel("session")
+    match outbound.get(opened)
+    | let ch: SshChannelState =>
+      h.assert_false(ch.authorized,
+        "a channel we opened must not be authorized before the peer confirms")
+    | None => h.fail("opened channel not found")
+    end
+    outbound.confirm_channel(opened, 7, 0x100000, 0x8000)
+    match outbound.get(opened)
+    | let ch: SshChannelState =>
+      h.assert_true(ch.authorized,
+        "CHANNEL_OPEN_CONFIRMATION must authorize a channel we opened")
+    | None => h.fail("confirmed channel not found")
+    end
+
 class iso _TestChannelDataSendWindowTracking is UnitTest
   fun name(): String => "ssh_channel/data_send_window_tracking"
 

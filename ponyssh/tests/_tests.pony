@@ -90,6 +90,11 @@ primitive \nodoc\ Tests is TestList
     test(_TestAesGcmKnownAnswer)
     test(_TestPacketReaderRejectsBadPadding)
     test(_TestPubkeyProbeThenSignVerifies)
+    test(_TestCipherSwitchUsesNewCipher)
+    test(_TestCipherSwitchDiscardsPartialPacket)
+    test(_TestChannelMaxPacketSizeClamped)
+    test(_TestChannelAuthorizedOnlyAfterDecision)
+    test(_TestAuthAttemptsCapped)
 
 class iso _TestErrorStrings is UnitTest
   fun name(): String => "ssh_error/error_strings"
