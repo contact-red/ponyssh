@@ -18,6 +18,29 @@ primitive SshChannelLimits
     """
     256
 
+  fun min_max_packet(): U32 =>
+    """
+    Floor for a peer's advertised channel packet size. The peer picks this value
+    off the wire, and it divides our outbound data: at 1 byte per packet each
+    byte of application output costs a 36-byte frame and a full AEAD operation.
+    256 keeps that overhead bounded while staying far below any size a real
+    implementation asks for, and well inside the 32768-byte payload RFC 4253
+    §6.1 requires every implementation to accept.
+    """
+    256
+
+  fun max_max_packet(): U32 =>
+    """
+    Ceiling for a peer's advertised channel packet size. Above the transport's
+    own 35000-byte packet limit we would frame packets our own reader — and a
+    conformant peer's — rejects. 32768 is the RFC 4253 §6.1 payload size.
+    """
+    32768
+
+  fun clamp_max_packet(value: U32): U32 =>
+    """Bring a peer-advertised channel packet size within the bounds above."""
+    value.max(min_max_packet()).min(max_max_packet())
+
 class SshChannelManager
   """
   Tracks channel state keyed by local channel id. The local id (the map key) is
@@ -43,12 +66,16 @@ class SshChannelManager
   fun ref confirm_channel(local_id: U32, remote_id: U32,
     remote_window: U32, max_packet_size: U32): (None | SshChannelError)
   =>
-    """Confirm a pending channel open."""
+    """
+    Confirm a pending channel open. The peer accepting the channel we opened is
+    what authorizes it, so this is where a channel of ours becomes usable.
+    """
     try
       let ch = _channels(local_id)?
       ch.remote_id = remote_id
       ch.remote_window = remote_window
-      ch.max_packet_size = max_packet_size
+      ch.max_packet_size = SshChannelLimits.clamp_max_packet(max_packet_size)
+      ch.authorized = true
       None
     else
       SshChannelClosed

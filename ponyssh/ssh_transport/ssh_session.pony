@@ -80,6 +80,10 @@ actor SshSession
   var _auth: (SshAuthStateMachine | None) = None
   var _host_key: (SshHostKeyPair | None) = None
   var _our_kexinit: (Array[U8] val | None) = None
+  // Set when the peer's KEXINIT for the initial key exchange has been accepted.
+  // A rekey's KEXINIT is tracked separately on its SshRekeyContext, so this is
+  // never reset: it guards the one exchange that can be replaced mid-flight.
+  var _kexinit_received: Bool = false
   var _encrypted: Bool = false
   // The host the client was configured to connect to, passed to the host-key
   // verification callback so the consumer can bind the key to a hostname
@@ -104,12 +108,17 @@ actor SshSession
   // initial key exchange only key-exchange packets are tolerated.
   var _strict_kex: Bool = false
   let _pending_sends: Array[Array[U8] val] = Array[Array[U8] val]
+  var _pending_bytes: USize = 0
   var _write_baseline: U32 = 0
   var _read_baseline: U32 = 0
   // Set the first time the session enters its terminal state, so teardown runs
   // once: the consumer sees a single ssh_disconnected and no duplicate
   // DISCONNECT is sent into an already-closed bridge.
   var _terminated: Bool = false
+  // Failed authentication attempts on this session. Without a cap an
+  // unauthenticated peer gets unlimited guesses down one connection at line
+  // rate, with no lockout and no connection churn for an operator to notice.
+  var _auth_failures: U32 = 0
 
   let _version_string: String val = "SSH-2.0-ponyssh_0.1"
 
@@ -171,9 +180,7 @@ actor SshSession
     rather than emitting one oversized CHANNEL_DATA a conformant peer rejects.
     """
     let max_packet = match _channel_manager.get(channel_id)
-      | let ch: SshChannelState =>
-        let m = ch.max_packet_size.usize()
-        if m == 0 then 32768 else m end
+      | let ch: SshChannelState => ch.max_packet_size.usize()
       | None =>
         _notify_channel_error(channel_id, SshChannelClosed)
         return
@@ -311,8 +318,7 @@ actor SshSession
 
   be auth_reject(remaining: Array[String val] val) =>
     match _state
-    | let _: SshStateAuth =>
-      _send_packet(SshAuthMessages.userauth_failure(remaining, false))
+    | let _: SshStateAuth => _auth_failed(remaining)
     end
 
   be accept_channel(channel_id: U32) =>
@@ -320,6 +326,9 @@ actor SshSession
     | let _: SshStateConnected =>
       match _channel_manager.get(channel_id)
       | let ch: SshChannelState =>
+        // This is the authorization decision for a channel the peer asked us to
+        // open. Until it lands, requests and data naming the channel are refused.
+        ch.authorized = true
         _send_packet(SshChannelMessages.channel_open_confirmation(
           ch.remote_id, ch.local_id, SshChannelWindow.initial(), 0x8000))
       end
@@ -535,6 +544,16 @@ actor SshSession
     """Handle messages during key exchange."""
     match msg_type
     | SshMsgTypes.kexinit() =>
+      // RFC 4253 §7.1: each side sends exactly one KEXINIT per key exchange. A
+      // second one replaces the whole SshStateKeyExchange, discarding an
+      // in-flight exchange along with any host-key approval the consumer is
+      // still answering — the approval would then be applied to whichever key
+      // the *next* exchange presented. Reject rather than reset.
+      if _kexinit_received then
+        _disconnect_with_error(SshUnexpectedMessage)
+        return
+      end
+      _kexinit_received = true
       match _kex
       | let kex: SshKexStateMachine =>
         match kex.receive_kexinit(payload, _prefs)
@@ -589,6 +608,14 @@ actor SshSession
       | SshRoleServer =>
         match _state
         | let s: SshStateKeyExchange =>
+          // One ECDH round per exchange. Without this an unauthenticated peer
+          // can stream KEX_ECDH_INITs down a single connection and make the
+          // server run an X25519 keygen, an X25519 derive and an Ed25519
+          // signature for each ~48-byte packet.
+          if s.ecdh_completed then
+            _disconnect_with_error(SshUnexpectedMessage)
+            return
+          end
           try
             let r = SshWireReader(payload)
             r.read_byte()?  // msg type
@@ -605,6 +632,16 @@ actor SshSession
       | SshRoleClient =>
         match _state
         | let s: SshStateKeyExchange =>
+          // One ECDH round per exchange. The session stays in KeyExchange with
+          // encryption already active while the consumer answers the host-key
+          // callback; a second reply arriving in that window would re-derive,
+          // re-arm host-key verification against a different key, and reset the
+          // writer's sequence number — the ChaCha20 nonce — to zero under the
+          // key already in use.
+          if s.ecdh_completed then
+            _disconnect_with_error(SshUnexpectedMessage)
+            return
+          end
           try
             let r = SshWireReader(payload)
             r.read_byte()?  // msg type
@@ -693,6 +730,7 @@ actor SshSession
           // Store shared secret and exchange hash for key derivation after NEWKEYS
           s.shared_secret = shared_secret
           s.exchange_hash = exchange_hash
+          s.ecdh_completed = true
 
           match hk.sign(exchange_hash)
           | let raw_sig: Array[U8] val =>
@@ -771,6 +809,7 @@ actor SshSession
 
           match SshHostKeyVerify.verify(host_key, raw_sig, exchange_hash)
           | true =>
+            s.ecdh_completed = true
             // Signature valid, send NEWKEYS immediately
             _send_packet(SshMessages.newkeys())
             // Strict KEX: our outgoing sequence number resets to zero at our
@@ -866,10 +905,21 @@ actor SshSession
         end
       end
     | SshMsgTypes.kex_ecdh_init() =>
+      // rk.derived is set once this rekey's ECDH round has been answered, so a
+      // repeat would re-run the same public-key work the initial-exchange guard
+      // rejects.
+      if rk.derived isnt None then
+        _disconnect_with_error(SshUnexpectedMessage)
+        return
+      end
       match _role
       | SshRoleServer => _rekey_server_ecdh(rk, payload)
       end
     | SshMsgTypes.kex_ecdh_reply() =>
+      if rk.derived isnt None then
+        _disconnect_with_error(SshUnexpectedMessage)
+        return
+      end
       match _role
       | SshRoleClient => _rekey_client_ecdh(rk, payload)
       end
@@ -1335,8 +1385,7 @@ actor SshSession
           // Enforce it so the service value bound into a publickey signature is
           // fixed rather than attacker-chosen.
           if service != "ssh-connection" then
-            _send_packet(SshAuthMessages.userauth_failure(
-              ["publickey"; "password"], false))
+            _auth_failed(["publickey"; "password"])
             return
           end
           let method_data: SshAuthMethodData val = match method
@@ -1362,8 +1411,7 @@ actor SshSession
             match pkd.signature
             | let _: Array[U8] val =>
               if not _verify_publickey_signature(username, service, pkd) then
-                _send_packet(SshAuthMessages.userauth_failure(
-                  ["publickey"; "password"], false))
+                _auth_failed(["publickey"; "password"])
                 return
               end
             end
@@ -1521,6 +1569,13 @@ actor SshSession
           | let c: SshChannelState => c
           | None => error
           end
+        // A channel existing is not the same as its open having been
+        // authorized: state is allocated when the peer's CHANNEL_OPEN arrives,
+        // but the consumer's decision is an asynchronous behavior, and a whole
+        // TCP segment is dispatched before it can run. Data pipelined behind
+        // CHANNEL_OPEN would otherwise reach the consumer for a channel the
+        // consumer goes on to reject.
+        if not ch.authorized then error end
         // Enforce the receive window we advertised. A peer that overruns it is
         // violating flow control; close the channel rather than deliver
         // unbounded data.
@@ -1551,7 +1606,14 @@ actor SshSession
         r.read_byte()?  // msg type
         let recipient_channel = r.read_u32()?
         let bytes_to_add = r.read_u32()?
-        _channel_manager.window_adjust(recipient_channel, bytes_to_add)
+        // Same gate as CHANNEL_DATA: a window grant on a channel whose open has
+        // not been authorized is not accounted for.
+        match _channel_manager.get(recipient_channel)
+        | let ch: SshChannelState =>
+          if ch.authorized then
+            _channel_manager.window_adjust(recipient_channel, bytes_to_add)
+          end
+        end
       end
     | SshChannelMsgTypes.channel_eof() =>
       None
@@ -1576,7 +1638,21 @@ actor SshSession
       match header
       | (let recipient_channel: U32, let request_type: String val,
          let want_reply: Bool) =>
-        if _channel_manager.get(recipient_channel) is None then return end
+        // A shell/exec/pty-req on a channel whose open has not been authorized
+        // would drive the consumer's handlers for a channel it is about to
+        // reject — the peer can pipeline the request behind CHANNEL_OPEN, and
+        // the whole segment is dispatched before the consumer's asynchronous
+        // decision runs. Answer it as a failure instead of dispatching it.
+        match _channel_manager.get(recipient_channel)
+        | let ch: SshChannelState =>
+          if not ch.authorized then
+            if want_reply then
+              _send_packet(SshChannelMessages.channel_failure(ch.remote_id))
+            end
+            return
+          end
+        | None => return
+        end
         // Parse and dispatch the request-specific body. A truncated body errors
         // out of this try and leaves dispatched = false.
         let dispatched =
@@ -1655,11 +1731,31 @@ actor SshSession
     only key-exchange traffic, as RFC 4253 §9 requires.
     """
     if _send_blackout then
+      // The peer opens the blackout with its KEXINIT and closes it by driving
+      // the exchange to NEWKEYS. A peer that opens one and then stops turns
+      // every packet we would have sent — including the replies its own traffic
+      // provokes — into a queued allocation that is never drained, so the queue
+      // is bounded and a peer that exceeds it loses the session.
+      if (_pending_sends.size() >= _max_pending_sends())
+        or ((_pending_bytes + payload.size()) > _max_pending_bytes())
+      then
+        _disconnect_with_error(SshPendingSendsExceeded)
+        return
+      end
       _pending_sends.push(payload)
+      _pending_bytes = _pending_bytes + payload.size()
       return
     end
     _frame_and_send(payload)
     _check_packet_limits()
+
+  fun _max_pending_sends(): USize =>
+    """Packets deferrable during a rekey send-blackout before we give up."""
+    1024
+
+  fun _max_pending_bytes(): USize =>
+    """Bytes deferrable during a rekey send-blackout before we give up."""
+    4 * 1024 * 1024
 
   fun ref _send_kex_packet(payload: Array[U8] val) =>
     """Send a key-exchange/transport packet, bypassing the rekey send-blackout."""
@@ -1678,6 +1774,7 @@ actor SshSession
     while _pending_sends.size() > 0 do
       try _frame_and_send(_pending_sends.shift()?) end
     end
+    _pending_bytes = 0
 
   fun _rekey_packet_limit(): U32 => 0x4000_0000  // 2^30: initiate rekey
   fun _hard_packet_limit(): U32 => 0x7000_0000   // backstop, well under 2^31
@@ -1756,6 +1853,25 @@ actor SshSession
     match _role
     | SshRoleClient =>
       _send_packet(SshAuthMessages.service_request("ssh-userauth"))
+    end
+
+  fun _max_auth_attempts(): U32 =>
+    """
+    Failed authentication attempts tolerated on one session before it is torn
+    down. Matches OpenSSH's MaxAuthTries default.
+    """
+    6
+
+  fun ref _auth_failed(remaining: Array[String val] val) =>
+    """
+    Answer a rejected authentication attempt and count it, disconnecting once
+    the cap is reached. Every rejection path routes through here: a path that
+    sent USERAUTH_FAILURE directly would hand the peer an uncounted guess.
+    """
+    _auth_failures = _auth_failures + 1
+    _send_packet(SshAuthMessages.userauth_failure(remaining, false))
+    if _auth_failures >= _max_auth_attempts() then
+      _disconnect_with_error(SshTooManyAuthAttempts)
     end
 
   fun _verify_publickey_signature(username: String val, service: String val,
