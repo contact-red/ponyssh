@@ -18,8 +18,9 @@ actor SshClientTcpBridge is (TCPConnectionActor & ClientLifecycleEventReceiver)
   fun ref _on_connection_failure(reason: ConnectionFailureReason) =>
     _session._tcp_connection_failed()
 
-  fun ref _on_received(data: Array[U8] iso) =>
+  fun ref _on_received(data: Array[U8] iso): ReadAction =>
     _session._tcp_received(consume data)
+    KeepReading
 
   fun ref _on_closed() =>
     _session._tcp_closed()
@@ -43,8 +44,12 @@ actor SshServerTcpBridge is (TCPConnectionActor & ServerLifecycleEventReceiver)
   fun ref _on_started() =>
     _session._tcp_connected()
 
-  fun ref _on_received(data: Array[U8] iso) =>
+  fun ref _on_start_failure(reason: StartFailureReason) =>
+    _session._tcp_closed()
+
+  fun ref _on_received(data: Array[U8] iso): ReadAction =>
     _session._tcp_received(consume data)
+    KeepReading
 
   fun ref _on_closed() =>
     _session._tcp_closed()
