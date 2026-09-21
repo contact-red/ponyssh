@@ -1,4 +1,4 @@
-use "lori"
+use "net"
 use "../ssh_transport"
 use "../ssh_auth"
 

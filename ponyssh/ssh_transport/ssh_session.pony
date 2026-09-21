@@ -1,4 +1,4 @@
-use "lori"
+use "net"
 use "../ssh_error"
 use "../ssh_crypto"
 use "../ssh_auth"

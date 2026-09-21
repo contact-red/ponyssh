@@ -1,5 +1,5 @@
 use "pony_test"
-use "lori"
+use "net"
 use "../ssh_transport"
 use "../ssh_crypto"
 use "../ssh_error"
