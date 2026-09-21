@@ -1,4 +1,4 @@
-use "lori"
+use "net"
 
 actor SshClientTcpBridge is (TCPConnectionActor & ClientLifecycleEventReceiver)
   var _tcp_connection: TCPConnection = TCPConnection.none()

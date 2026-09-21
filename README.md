@@ -49,7 +49,7 @@ brew install openssl@3
 A minimal echo server. See [`examples/echo-server`](examples/echo-server) for the complete, runnable version.
 
 ```pony
-use "lori"
+use "net"
 use "ssh_transport"
 use "ssh_server"
 
@@ -78,7 +78,7 @@ Your `MyServerNotify` implements `SshServerNotify`. Authentication and authoriza
 A minimal client:
 
 ```pony
-use "lori"
+use "net"
 use "ssh_transport"
 use "ssh_auth"
 use "ssh_client"

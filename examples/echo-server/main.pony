@@ -1,4 +1,4 @@
-use "lori"
+use "net"
 use "term"
 use "collections"
 use "encode/base64"

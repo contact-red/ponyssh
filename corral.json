@@ -9,12 +9,7 @@
     "ponyssh/ssh_server",
     "ponyssh/tests"
   ],
-  "deps": [
-    {
-      "locator": "github.com/ponylang/lori.git",
-      "version": "0.22.0"
-    }
-  ],
+  "deps": [],
   "info": {
     "description": "Production-grade SSH-2 client/server library for Pony",
     "license": "BSD-2-Clause",
