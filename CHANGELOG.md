@@ -83,4 +83,5 @@ All notable changes to this project will be documented in this file. This projec
   is the construction the Terrapin and CBC-padding-oracle attacks target. It
   was already absent from the default preferences but remained negotiable if a
   consumer listed it explicitly; it can no longer be negotiated.
+- Use the standard library's `net` package instead of lori ([PR #12](https://github.com/contact-red/ponyssh/pull/12))
 
