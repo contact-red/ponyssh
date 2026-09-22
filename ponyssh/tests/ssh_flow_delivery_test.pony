@@ -102,6 +102,9 @@ actor \nodoc\ _FlowDeliveryClientNotify is SshClientNotify
     _channel_id = channel_id
     _send_next(session)
 
+  be ssh_channel_request_result(session: SshSession tag, channel_id: U32,
+    accepted: Bool) => None
+
   fun ref _send_next(session: SshSession tag) =>
     if _offset >= _source.size() then return end
     let end_offset = (_offset + 32768).min(_source.size())

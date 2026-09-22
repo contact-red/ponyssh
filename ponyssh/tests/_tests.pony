@@ -79,6 +79,7 @@ primitive \nodoc\ Tests is TestList
     test(_TestPubkeyVerifyWrongSessionRejected)
     test(_TestPubkeyVerifyWrongKeyRejected)
     test(_TestIntegrationHandshake)
+    test(_TestChannelRequestResults)
     test(_TestIntegrationFlowDelivery)
     test(_TestIntegrationPubkeyAuth)
     test(_TestIntegrationHostKeyReject)

@@ -100,6 +100,8 @@ actor Main
 
 `MyClientNotify` implements `SshClientNotify`. It must approve the server host key in `ssh_verify_host_key` (call `session.accept_host_key()` or `session.reject_host_key()`) and acts on the session once `ssh_ready` fires.
 
+When a client sends `channel_request_shell` or `channel_request_exec` with `want_reply = true`, `ssh_channel_request_result` reports the channel ID and whether the peer accepted the request. SSH replies do not identify the request. Wait for a result before sending another reply-seeking request on the same channel if you need to associate the result with a request.
+
 `channel_send` accepts at most 32768 bytes per call. Every call produces `ssh_channel_send_result` with the original array, the number of bytes admitted locally, and a `SshSendOutcome`. `SshSendComplete` means the full array was admitted to the TCP bridge or the bounded rekey queue; it does not confirm delivery to the peer. If the result is `SshSendWindowBlocked`, retain `data.trim(accepted)` and retry it after `ssh_channel_window_available`. A window hint does not reserve credit, so a retry may block again. Clear retained data when the channel or session closes.
 
 Both `SshClientNotify` and `SshServerNotify` implementations must provide the result and window callbacks. The [echo server](examples/echo-server/main.pony) retains a blocked suffix and retries it after a hint.

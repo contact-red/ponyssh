@@ -332,14 +332,19 @@ actor SshSession
     """
     Ask the peer to start a login shell on a channel we opened (RFC 4254 §6.5).
     The channel's output arrives via ssh_channel_data. A no-op unless the
-    session is Connected and the channel exists.
+    session is Connected and the channel is open and authorized.
     """
     match _state
     | let _: SshStateConnected =>
       match _channel_manager.get(channel_id)
       | let ch: SshChannelState =>
-        _send_packet(SshChannelMessages.channel_request_shell(
-          ch.remote_id, want_reply))
+        if ch.open and ch.authorized then
+          let sent = _send_packet(SshChannelMessages.channel_request_shell(
+            ch.remote_id, want_reply))
+          if sent and want_reply then
+            ch.pending_request_replies = ch.pending_request_replies + 1
+          end
+        end
       end
     end
 
@@ -349,14 +354,19 @@ actor SshSession
     """
     Ask the peer to run a single command on a channel we opened (RFC 4254 §6.5).
     The command's output arrives via ssh_channel_data. A no-op unless the
-    session is Connected and the channel exists.
+    session is Connected and the channel is open and authorized.
     """
     match _state
     | let _: SshStateConnected =>
       match _channel_manager.get(channel_id)
       | let ch: SshChannelState =>
-        _send_packet(SshChannelMessages.channel_request_exec(
-          ch.remote_id, command, want_reply))
+        if ch.open and ch.authorized then
+          let sent = _send_packet(SshChannelMessages.channel_request_exec(
+            ch.remote_id, command, want_reply))
+          if sent and want_reply then
+            ch.pending_request_replies = ch.pending_request_replies + 1
+          end
+        end
       end
     end
 
@@ -1850,8 +1860,10 @@ actor SshSession
           end
         end
       end
-    | SshChannelMsgTypes.channel_success() => None
-    | SshChannelMsgTypes.channel_failure() => None
+    | SshChannelMsgTypes.channel_success() =>
+      _handle_channel_request_result(payload, true)
+    | SshChannelMsgTypes.channel_failure() =>
+      _handle_channel_request_result(payload, false)
     | SshMsgTypes.disconnect() =>
       _peer_disconnected()
     else
@@ -1860,6 +1872,26 @@ actor SshSession
       // offending packet. The reader has already advanced past it, so that
       // packet's number is one less than the reader's current sequence number.
       _send_packet(SshMessages.unimplemented(_reader.sequence_number() - 1))
+    end
+
+  fun ref _handle_channel_request_result(payload: Array[U8] val,
+    accepted: Bool)
+  =>
+    if payload.size() != 5 then return end
+    try
+      let r = SshWireReader(payload)
+      r.read_byte()?
+      let channel_id = r.read_u32()?
+      match _channel_manager.get(channel_id)
+      | let ch: SshChannelState =>
+        if ch.authorized and (ch.pending_request_replies > 0) then
+          ch.pending_request_replies = ch.pending_request_replies - 1
+          match _client_notify
+          | let n: SshClientNotify tag =>
+            n.ssh_channel_request_result(this, channel_id, accepted)
+          end
+        end
+      end
     end
 
   fun ref _send_packet(payload: Array[U8] val): Bool =>
