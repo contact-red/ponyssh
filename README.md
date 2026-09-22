@@ -57,7 +57,7 @@ actor Main
   new create(env: Env) =>
     let pem: Array[U8] val = MyHostKey()  // your host key, PEM-encoded
 
-    // SshServerConfig validates the host key, so its constructor is partial.
+    // SshServerConfig validates its host key and channel window.
     // Algorithm preferences default to the implemented set; to customise them
     // pass `SshAlgorithmPreferences` with named arguments and override only the
     // categories you need.
@@ -65,7 +65,7 @@ actor Main
       try
         SshServerConfig(pem, "0.0.0.0", "2222")?
       else
-        env.out.print("invalid host key; aborting")
+        env.out.print("invalid server configuration; aborting")
         return
       end
 
@@ -74,6 +74,8 @@ actor Main
 ```
 
 Your `MyServerNotify` implements `SshServerNotify`. The listener reports its bind outcome to it through `ssh_listener_started` and `ssh_listener_failed`; a client started before `ssh_listener_started` can be refused. Authentication and authorization **deny by default**: implement `validate_password` / `validate_publickey` to accept credentials, and override the channel/shell callbacks to grant access (they reject unless overridden).
+
+`SshServerConfig` advertises a 2 MiB receive window per channel by default. Set `channel_window'` in its constructor to use another value of at least 256 bytes.
 
 A minimal client:
 
@@ -92,6 +94,10 @@ actor Main
 ```
 
 `MyClientNotify` implements `SshClientNotify`. It must approve the server host key in `ssh_verify_host_key` (call `session.accept_host_key()` or `session.reject_host_key()`) and acts on the session once `ssh_ready` fires.
+
+`channel_send` accepts at most 32768 bytes per call. Every call produces `ssh_channel_send_result` with the original array, the number of bytes admitted locally, and a `SshSendOutcome`. `SshSendComplete` means the full array was admitted to the TCP bridge or the bounded rekey queue; it does not confirm delivery to the peer. If the result is `SshSendWindowBlocked`, retain `data.trim(accepted)` and retry it after `ssh_channel_window_available`. A window hint does not reserve credit, so a retry may block again. Clear retained data when the channel or session closes.
+
+Both `SshClientNotify` and `SshServerNotify` implementations must provide the result and window callbacks. The [echo server](examples/echo-server/main.pony) retains a blocked suffix and retries it after a hint.
 
 ## API Documentation
 

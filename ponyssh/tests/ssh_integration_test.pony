@@ -59,6 +59,12 @@ actor _IntegrationClientNotify is SshClientNotify
     data: Array[U8] val) => None
   be ssh_channel_error(session: SshSession tag, channel_id: U32,
     err: SshChannelError val) => None
+  be ssh_channel_send_result(session: SshSession tag, channel_id: U32,
+    data: Array[U8] val, accepted: USize, outcome: SshSendOutcome) =>
+    _h.assert_eq[USize](data.size(), accepted)
+    _h.assert_true(outcome is SshSendComplete)
+  be ssh_channel_window_available(session: SshSession tag,
+    channel_id: U32) => None
   be ssh_channel_closed(session: SshSession tag, channel_id: U32) => None
 
   be ssh_error(session: SshSession tag, err: SshTransportError val) =>
@@ -75,6 +81,11 @@ actor _IntegrationServerNotify is SshServerNotify
   let _client_config: SshClientConfig val
   let _client_notify: SshClientNotify tag
   var _listener: (DisposableActor tag | None) = None
+
+  be ssh_channel_send_result(session: SshSession tag, channel_id: U32,
+    data: Array[U8] val, accepted: USize, outcome: SshSendOutcome) => None
+  be ssh_channel_window_available(session: SshSession tag,
+    channel_id: U32) => None
 
   new create(h: TestHelper, connect_auth: TCPConnectAuth,
     client_config: SshClientConfig val, client_notify: SshClientNotify tag)

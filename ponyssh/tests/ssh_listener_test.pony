@@ -30,6 +30,11 @@ actor \nodoc\ _BindFailureNotify is SshServerNotify
   let _first: DisposableActor tag
   var _second: (DisposableActor tag | None) = None
 
+  be ssh_channel_send_result(session: SshSession tag, channel_id: U32,
+    data: Array[U8] val, accepted: USize, outcome: SshSendOutcome) => None
+  be ssh_channel_window_available(session: SshSession tag,
+    channel_id: U32) => None
+
   new create(h: TestHelper, config: SshServerConfig val, auth: TCPListenAuth) =>
     _h = h
     _config = config
