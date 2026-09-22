@@ -86,4 +86,5 @@ All notable changes to this project will be documented in this file. This projec
   consumer listed it explicitly; it can no longer be negotiated.
 - Use the standard library's `net` package instead of lori ([PR #12](https://github.com/contact-red/ponyssh/pull/12))
 - Report server configuration errors ([PR #15](https://github.com/contact-red/ponyssh/pull/15))
+- Report channel request replies to clients ([PR #16](https://github.com/contact-red/ponyssh/pull/16))
 
