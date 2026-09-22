@@ -106,6 +106,31 @@ class SshChannelManager
       SshChannelClosed
     end
 
+  fun ref channel_send_candidate(local_id: U32):
+    (SshChannelState ref | SshChannelError)
+  =>
+    """Return an authorized channel for a data send or local close."""
+    try
+      let ch = _channels(local_id)?
+      if (not ch.open) or (not ch.authorized) then
+        return SshChannelClosed
+      end
+      ch
+    else
+      SshChannelClosed
+    end
+
+  fun ref channel_data_admitted(local_id: U32, data_size: USize) =>
+    """Debit the peer window after a segment has been admitted to transport."""
+    try
+      let ch = _channels(local_id)?
+      ch.remote_window = ch.remote_window - data_size.u32()
+    end
+
+  fun ref clear_send_blocked() =>
+    """Release all pending window hints when the session ends."""
+    for ch in _channels.values() do ch.send_blocked = false end
+
   fun ref channel_data_received(local_id: U32, data_size: USize):
     (U32 | SshChannelError)
   =>

@@ -16,6 +16,7 @@ class SshChannelState
   // inbound packets keep being dispatched synchronously, so channel state exists
   // before it is authorized and messages naming it must be refused until then.
   var authorized: Bool = false
+  var send_blocked: Bool = false
   var pty: (SshPtyState val | None) = None
   var pty_pending: Bool = false
 

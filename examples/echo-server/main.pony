@@ -38,6 +38,7 @@ actor Main
 actor EchoServerNotify is SshServerNotify
   let _env: Env
   let _authorized_key: Array[U8] val = _AuthorizedKey()
+  let _pending: Map[U32, Array[U8] val] = Map[U32, Array[U8] val]
 
   new create(env: Env) =>
     _env = env
@@ -74,12 +75,39 @@ actor EchoServerNotify is SshServerNotify
     // directly (the xterm-256color 38;5;N foreground select), which every
     // modern terminal understands — no terminfo-database lookup needed for a
     // demo.
-    session.channel_send(channel_id, ANSI.clear().array())
-    for col in Range[I32](0, 255) do
-      session.channel_send(channel_id,
-        ("\x1B[38;5;" + col.string() + "m").array())
-      session.channel_send(channel_id, ("Hello World!" + col.string()).array())
+    let splash = recover val
+      let s = String.create()
+      s.append(ANSI.clear())
+      for col in Range[I32](0, 255) do
+        s.append("\x1B[38;5;" + col.string() + "m")
+        s.append("Hello World!" + col.string())
+      end
+      s
     end
+    let data = splash.array()
+    _pending(channel_id) = data
+    session.channel_send(channel_id, data)
+
+  be ssh_channel_send_result(session: SshSession tag, channel_id: U32,
+    data: Array[U8] val, accepted: USize, outcome: SshSendOutcome)
+  =>
+    match outcome
+    | SshSendComplete => try _pending.remove(channel_id)? end
+    | SshSendWindowBlocked => _pending(channel_id) = data.trim(accepted)
+    else
+      try _pending.remove(channel_id)? end
+    end
+
+  be ssh_channel_window_available(session: SshSession tag,
+    channel_id: U32)
+  =>
+    try session.channel_send(channel_id, _pending(channel_id)?) end
+
+  be ssh_channel_closed(session: SshSession tag, channel_id: U32) =>
+    try _pending.remove(channel_id)? end
+
+  be ssh_disconnected(session: SshSession tag) =>
+    _pending.clear()
 
 primitive _EchoServerKey
   fun apply(): Array[U8] val =>
@@ -102,4 +130,3 @@ primitive _AuthorizedKey
     else
       recover val Array[U8] end
     end
-

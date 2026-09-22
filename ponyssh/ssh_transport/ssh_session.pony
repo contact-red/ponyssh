@@ -171,6 +171,8 @@ actor SshSession
   be channel_send(channel_id: U32, data: Array[U8] val) =>
     match _state
     | let _: SshStateConnected => _channel_send_segmented(channel_id, data)
+    else
+      _notify_send_result(channel_id, data, 0, SshSendClosed)
     end
 
   fun ref _channel_send_segmented(channel_id: U32, data: Array[U8] val) =>
@@ -179,24 +181,31 @@ actor SshSession
     advertised max_packet_size (and no larger than its remaining send window),
     rather than emitting one oversized CHANNEL_DATA a conformant peer rejects.
     """
-    let max_packet = match _channel_manager.get(channel_id)
-      | let ch: SshChannelState => ch.max_packet_size.usize()
-      | None =>
-        _notify_channel_error(channel_id, SshChannelClosed)
-        return
-      end
+    let ch = match _channel_manager.get(channel_id)
+    | let c: SshChannelState => c
+    | None =>
+      _notify_send_result(channel_id, data, 0, SshSendClosed)
+      return
+    end
+    if not ch.open then
+      _notify_send_result(channel_id, data, 0, SshSendClosed)
+      return
+    end
+    if not ch.authorized then
+      _notify_send_result(channel_id, data, 0, SshSendNotReady)
+      return
+    end
+    if data.size() > 32768 then
+      _notify_send_result(channel_id, data, 0, SshSendTooLarge)
+      return
+    end
+    let max_packet = ch.max_packet_size.usize()
     var offset: USize = 0
     while offset < data.size() do
-      let window = match _channel_manager.get(channel_id)
-        | let ch: SshChannelState => ch.remote_window.usize()
-        | None =>
-          _notify_channel_error(channel_id, SshChannelClosed)
-          return
-        end
+      let window = ch.remote_window.usize()
       if window == 0 then
-        // The peer's send window is exhausted; the remainder cannot go out
-        // until it grants more via CHANNEL_WINDOW_ADJUST.
-        _notify_channel_error(channel_id, SshWindowExhausted)
+        ch.send_blocked = true
+        _notify_send_result(channel_id, data, offset, SshSendWindowBlocked)
         return
       end
       let seg_len = (data.size() - offset).min(max_packet).min(window)
@@ -205,15 +214,20 @@ actor SshSession
         b.copy_from(data, offset, 0, seg_len)
         b
       end
-      match _channel_manager.channel_data_send(channel_id, seg_len)
-      | let remote_id: U32 =>
-        _send_packet(SshChannelMessages.channel_data(remote_id, segment))
-      | let err: SshChannelError =>
-        _notify_channel_error(channel_id, err)
+      if not _send_packet(SshChannelMessages.channel_data(
+        ch.remote_id, segment))
+      then
+        _notify_send_result(channel_id, data, offset, SshSendClosed)
         return
       end
+      _channel_manager.channel_data_admitted(channel_id, seg_len)
       offset = offset + seg_len
+      if _terminated then
+        _notify_send_result(channel_id, data, offset, SshSendClosed)
+        return
+      end
     end
+    _notify_send_result(channel_id, data, offset, SshSendComplete)
 
   be channel_request_shell(channel_id: U32, want_reply: Bool = true) =>
     """
@@ -250,10 +264,10 @@ actor SshSession
   be channel_close(channel_id: U32) =>
     match _state
     | let _: SshStateConnected =>
-      match _channel_manager.channel_data_send(channel_id, 0)
-      | let remote_id: U32 =>
-        _send_packet(SshChannelMessages.channel_eof(remote_id))
-        _send_packet(SshChannelMessages.channel_close(remote_id))
+      match _channel_manager.channel_send_candidate(channel_id)
+      | let ch: SshChannelState =>
+        _send_packet(SshChannelMessages.channel_eof(ch.remote_id))
+        _send_packet(SshChannelMessages.channel_close(ch.remote_id))
         _channel_manager.close_channel(channel_id)
         _notify_channel_closed(channel_id)
       | let _: SshChannelError => None  // Already closed
@@ -283,6 +297,7 @@ actor SshSession
     _terminated = true
     _send_packet(SshMessages.disconnect(
       SshDisconnectCodes.by_application(), msg))
+    _finish_terminal()
     _close_bridge()
     _state = SshStateDisconnected(None)
     _notify_disconnected()
@@ -380,12 +395,14 @@ actor SshSession
   be _tcp_closed() =>
     if _terminated then return end
     _terminated = true
+    _finish_terminal()
     _state = SshStateDisconnected(SshConnectionLost)
     _notify_disconnected()
 
   be _tcp_connection_failed() =>
     if _terminated then return end
     _terminated = true
+    _finish_terminal()
     _state = SshStateDisconnected(SshConnectionLost)
     _notify_error(SshConnectionLost)
     _notify_disconnected()
@@ -1099,7 +1116,7 @@ actor SshSession
     end
     rk.sent_newkeys = true
     _send_blackout = false
-    _flush_pending_sends()
+    if not _flush_pending_sends() then return end
     _maybe_finish_rekey(rk)
 
   fun ref _rekey_recv_newkeys(rk: SshRekeyContext) =>
@@ -1611,7 +1628,12 @@ actor SshSession
         match _channel_manager.get(recipient_channel)
         | let ch: SshChannelState =>
           if ch.authorized then
+            let was_blocked = ch.send_blocked and (ch.remote_window == 0)
             _channel_manager.window_adjust(recipient_channel, bytes_to_add)
+            if was_blocked and (ch.remote_window > 0) then
+              ch.send_blocked = false
+              _notify_window_available(recipient_channel)
+            end
           end
         end
       end
@@ -1724,7 +1746,7 @@ actor SshSession
       _send_packet(SshMessages.unimplemented(_reader.sequence_number() - 1))
     end
 
-  fun ref _send_packet(payload: Array[U8] val) =>
+  fun ref _send_packet(payload: Array[U8] val): Bool =>
     """
     Frame and send a packet. While a rekey is in its send-blackout (from our
     KEXINIT to our NEWKEYS) non-key-exchange packets are deferred so we emit
@@ -1740,14 +1762,18 @@ actor SshSession
         or ((_pending_bytes + payload.size()) > _max_pending_bytes())
       then
         _disconnect_with_error(SshPendingSendsExceeded)
-        return
+        return false
       end
       _pending_sends.push(payload)
       _pending_bytes = _pending_bytes + payload.size()
-      return
+      return true
     end
-    _frame_and_send(payload)
+    if not _frame_and_send(payload) then
+      _disconnect_with_error(SshConnectionLost)
+      return false
+    end
     _check_packet_limits()
+    true
 
   fun _max_pending_sends(): USize =>
     """Packets deferrable during a rekey send-blackout before we give up."""
@@ -1761,20 +1787,31 @@ actor SshSession
     """Send a key-exchange/transport packet, bypassing the rekey send-blackout."""
     _frame_and_send(payload)
 
-  fun ref _frame_and_send(payload: Array[U8] val) =>
+  fun ref _frame_and_send(payload: Array[U8] val): Bool =>
+    if _bridge is None then return false end
     let block_size: USize = _current_block_size()
     let packet = _writer.write(payload, block_size)
     match _bridge
     | let b: SshClientTcpBridge tag => b.write(consume packet)
     | let b: SshServerTcpBridge tag => b.write(consume packet)
     end
+    true
 
-  fun ref _flush_pending_sends() =>
+  fun ref _flush_pending_sends(): Bool =>
     """Send packets deferred during the rekey send-blackout, in order."""
     while _pending_sends.size() > 0 do
-      try _frame_and_send(_pending_sends.shift()?) end
+      try
+        if not _frame_and_send(_pending_sends(0)?) then
+          _disconnect_with_error(SshConnectionLost)
+          return false
+        end
+        _pending_sends.shift()?
+      else
+        _Unreachable()
+      end
     end
     _pending_bytes = 0
+    true
 
   fun _rekey_packet_limit(): U32 => 0x4000_0000  // 2^30: initiate rekey
   fun _hard_packet_limit(): U32 => 0x7000_0000   // backstop, well under 2^31
@@ -1818,6 +1855,7 @@ actor SshSession
     _terminated = true
     _send_packet(SshMessages.disconnect(
       SshDisconnectCodes.protocol_error(), err.string()))
+    _finish_terminal()
     _close_bridge()
     _state = SshStateDisconnected(err)
     _notify_error(err)
@@ -1827,8 +1865,14 @@ actor SshSession
     """React once to a peer-initiated DISCONNECT message."""
     if _terminated then return end
     _terminated = true
+    _finish_terminal()
     _state = SshStateDisconnected(SshConnectionLost)
     _notify_disconnected()
+
+  fun ref _finish_terminal() =>
+    _pending_sends.clear()
+    _pending_bytes = 0
+    _channel_manager.clear_send_blocked()
 
   fun ref _close_bridge() =>
     """Hard-close the TCP bridge to ensure immediate resource cleanup."""
@@ -1926,6 +1970,28 @@ actor SshSession
     end
     match _server_notify
     | let n: SshServerNotify tag => n.ssh_channel_error(this, channel_id, err)
+    end
+
+  fun ref _notify_send_result(channel_id: U32, data: Array[U8] val,
+    accepted: USize, outcome: SshSendOutcome)
+  =>
+    match _client_notify
+    | let n: SshClientNotify tag =>
+      n.ssh_channel_send_result(this, channel_id, data, accepted, outcome)
+    end
+    match _server_notify
+    | let n: SshServerNotify tag =>
+      n.ssh_channel_send_result(this, channel_id, data, accepted, outcome)
+    end
+
+  fun ref _notify_window_available(channel_id: U32) =>
+    match _client_notify
+    | let n: SshClientNotify tag =>
+      n.ssh_channel_window_available(this, channel_id)
+    end
+    match _server_notify
+    | let n: SshServerNotify tag =>
+      n.ssh_channel_window_available(this, channel_id)
     end
 
   fun ref _notify_channel_closed(channel_id: U32) =>
