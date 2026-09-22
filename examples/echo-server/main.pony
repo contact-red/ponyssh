@@ -29,8 +29,12 @@ actor Main
       recover val let a = Array[String val]; a.push("hmac-sha2-256"); a end,
       recover val let a = Array[String val]; a.push("hmac-sha2-256"); a end)
     let config =
-      try SshServerConfig(pem, "0.0.0.0", "2222", prefs)?
-      else env.out.print("Invalid host key; aborting."); return
+      match MakeSshServerConfig(pem, "0.0.0.0", "2222", prefs)
+      | let ready: SshServerConfig val => ready
+      | let err: SshServerConfigError =>
+        env.err.print(err.string())
+        env.exitcode(1)
+        return
       end
     let auth = TCPListenAuth(env.root)
     SshListener(auth, config, EchoServerNotify(env))

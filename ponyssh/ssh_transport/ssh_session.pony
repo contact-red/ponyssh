@@ -33,10 +33,8 @@ class val SshClientConfig
 
 class val SshServerConfig
   """
-  Immutable configuration for a server: the PEM-encoded host key, the listen
-  host and port, algorithm preferences, and advertised channel receive window.
-  The constructor validates the host key and requires a window of at least 256
-  bytes.
+  Immutable server settings. Use MakeSshServerConfig to load the host key PEM
+  and require a channel receive window of at least 256 bytes before listening.
   """
   let host_key_pem: Array[U8] val
   let listen_host: String val
@@ -44,23 +42,36 @@ class val SshServerConfig
   let algorithms: SshAlgorithmPreferences val
   let channel_window: U32
 
-  new val create(host_key_pem': Array[U8] val,
-    listen_host': String val = "127.0.0.1",
-    listen_port': String val = "22",
-    algorithms': SshAlgorithmPreferences val =
-      SshDefaultAlgorithms.preferences(),
-    channel_window': U32 = SshChannelWindow.initial()) ?
+  new val _create(host_key_pem': Array[U8] val,
+    listen_host': String val, listen_port': String val,
+    algorithms': SshAlgorithmPreferences val, channel_window': U32)
   =>
-    // Validate the host key up front. Without this an unparseable key is only
-    // discovered at key-exchange time, after which the server silently drops
-    // every connection. Erroring here surfaces the misconfiguration at setup.
-    SshHostKeyPair.create(host_key_pem')?
-    if channel_window' < SshChannelLimits.min_max_packet() then error end
     host_key_pem = host_key_pem'
     listen_host = listen_host'
     listen_port = listen_port'
     algorithms = algorithms'
     channel_window = channel_window'
+
+primitive MakeSshServerConfig
+  """Load server host key PEM and check the channel receive window."""
+  fun apply(host_key_pem': Array[U8] val,
+    listen_host': String val = "127.0.0.1",
+    listen_port': String val = "22",
+    algorithms': SshAlgorithmPreferences val =
+      SshDefaultAlgorithms.preferences(),
+    channel_window': U32 = SshChannelWindow.initial()):
+    (SshServerConfig val | SshServerConfigError)
+  =>
+    """An invalid host key takes precedence when both inputs are invalid."""
+    try SshHostKeyPair.create(host_key_pem')?
+    else return SshServerHostKeyLoadFailed end
+
+    let minimum = SshChannelLimits.min_max_packet()
+    if channel_window' < minimum then
+      return SshServerChannelWindowTooSmall(channel_window', minimum)
+    end
+    SshServerConfig._create(host_key_pem', listen_host', listen_port',
+      algorithms', channel_window')
 
 actor SshSession
   """

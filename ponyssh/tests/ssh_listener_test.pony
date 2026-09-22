@@ -1,6 +1,7 @@
 use "pony_test"
 use "net"
 use "../ssh_transport"
+use "../ssh_error"
 use "../ssh_auth"
 use "../ssh_server"
 
@@ -14,8 +15,9 @@ class \nodoc\ iso _TestListenerBindFailure is UnitTest
     h.long_test(10_000_000_000)
 
     let config =
-      try SshServerConfig(_TestEd25519Pem(), "127.0.0.1", "19832")?
-      else h.fail("invalid host key"); return
+      match MakeSshServerConfig(_TestEd25519Pem(), "127.0.0.1", "19832")
+      | let created: SshServerConfig val => created
+      | let err: SshServerConfigError => h.fail(err.string()); return
       end
     _BindFailureNotify(h, config, TCPListenAuth(h.env.root))
 
