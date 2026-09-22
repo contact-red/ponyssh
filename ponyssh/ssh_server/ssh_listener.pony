@@ -5,7 +5,9 @@ actor SshListener is TCPListenerActor
   """
   Accepts inbound TCP connections on the configured host/port and starts a
   server SshSession for each, wiring its TCP bridge and notifying the consumer's
-  SshServerNotify. Call dispose() (inherited) to stop listening.
+  SshServerNotify. The bind outcome goes to the same notify:
+  ssh_listener_started once accepting, ssh_listener_failed if the bind failed.
+  Call dispose() (inherited) to stop listening.
   """
   var _tcp_listener: TCPListener = TCPListener.none()
   let _config: SshServerConfig val
@@ -30,6 +32,6 @@ actor SshListener is TCPListenerActor
     _notify.ssh_session_started(session)
     bridge
 
-  fun ref _on_listening() => None
-  fun ref _on_listen_failure() => None
+  fun ref _on_listening() => _notify.ssh_listener_started(this)
+  fun ref _on_listen_failure() => _notify.ssh_listener_failed(this)
   fun ref _on_closed() => None

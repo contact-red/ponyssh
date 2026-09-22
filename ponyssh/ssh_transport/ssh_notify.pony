@@ -34,6 +34,11 @@ interface SshServerNotify
   authorization callback rejects unless overridden — there is no permissive
   default to forget. validate_password and validate_publickey have no default
   at all, so the compiler requires every server to state its auth policy.
+
+  The SshListener that starts sessions reports its bind outcome here too:
+  ssh_listener_started once it is bound and accepting, ssh_listener_failed if
+  the bind failed. Start clients only after ssh_listener_started; a connect
+  issued before it can be refused.
   """
 
   // --- Authentication policy. Consulted by the default ssh_auth_request. ---
@@ -52,6 +57,24 @@ interface SshServerNotify
 
   // --- Lifecycle ---
 
+  // The listener is an SshListener, but ssh_server imports this package, so
+  // naming it here would be a package cycle. DisposableActor is the interface
+  // an SshListener satisfies that this package can see.
+  be ssh_listener_started(listener: DisposableActor tag) => None
+    """
+    The listener is bound and accepting connections. It arrives before any
+    ssh_session_started from that listener. `listener` is the SshListener that
+    reported, seen as a DisposableActor: compare it with `is` against the
+    listeners you created, and call dispose() on it to stop listening. To
+    compare, the notify must already know the listener when the callback
+    arrives: construct the listener inside the notify, or record it in the
+    same behaviour that constructs it.
+    """
+  be ssh_listener_failed(listener: DisposableActor tag) => None
+    """
+    The listener could not bind, so no connection will ever arrive on it.
+    `listener` is the SshListener that reported, as in ssh_listener_started.
+    """
   be ssh_session_started(session: SshSession tag) => None
   be ssh_session_ready(session: SshSession tag) => None
 

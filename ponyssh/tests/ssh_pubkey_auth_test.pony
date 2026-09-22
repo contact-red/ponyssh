@@ -40,19 +40,15 @@ class iso _TestIntegrationPubkeyAuth is UnitTest
       else h.fail("invalid host key"); return
       end
 
-    let server_notify = _PubkeyServerNotify(h)
-    let listen_auth = TCPListenAuth(h.env.root)
-    let listener = SshListener(listen_auth, server_config, server_notify)
-    server_notify.set_listener(listener)
-
     // Client authenticates with the ponyssh-testing private key
     let client_key = _TestPubkeyPem()
     let client_config = SshClientConfig("127.0.0.1", "19828",
       "testuser",
       recover val [as SshAuthMethod val: SshPublicKeyAuth(client_key)] end)
-    let connect_auth = TCPConnectAuth(h.env.root)
-    SshConnector.connect(connect_auth, client_config,
-      _PubkeyClientNotify(h))
+    let server_notify = _PubkeyServerNotify(h, TCPConnectAuth(h.env.root),
+      client_config, _PubkeyClientNotify(h))
+    let listen_auth = TCPListenAuth(h.env.root)
+    h.dispose_when_done(SshListener(listen_auth, server_config, server_notify))
 
 
 actor _PubkeyClientNotify is SshClientNotify
@@ -82,7 +78,10 @@ actor _PubkeyClientNotify is SshClientNotify
   be ssh_channel_error(session: SshSession tag, channel_id: U32,
     err: SshChannelError val) => None
   be ssh_channel_closed(session: SshSession tag, channel_id: U32) => None
-  be ssh_error(session: SshSession tag, err: SshTransportError val) => None
+
+  be ssh_error(session: SshSession tag, err: SshTransportError val) =>
+    _h.fail("client error: " + err.string())
+    _h.complete(true)
 
   be ssh_disconnected(session: SshSession tag) =>
     _h.complete(true)
@@ -91,13 +90,26 @@ actor _PubkeyClientNotify is SshClientNotify
 actor _PubkeyServerNotify is SshServerNotify
   let _h: TestHelper
   let _authorized_key: Array[U8] val = _TestPubkeyAuthorized()
-  var _listener: (SshListener tag | None) = None
+  let _connect_auth: TCPConnectAuth
+  let _client_config: SshClientConfig val
+  let _client_notify: SshClientNotify tag
+  var _listener: (DisposableActor tag | None) = None
 
-  new create(h: TestHelper) =>
+  new create(h: TestHelper, connect_auth: TCPConnectAuth,
+    client_config: SshClientConfig val, client_notify: SshClientNotify tag)
+  =>
     _h = h
+    _connect_auth = connect_auth
+    _client_config = client_config
+    _client_notify = client_notify
 
-  be set_listener(listener: SshListener tag) =>
+  be ssh_listener_started(listener: DisposableActor tag) =>
     _listener = listener
+    SshConnector.connect(_connect_auth, _client_config, _client_notify)
+
+  be ssh_listener_failed(listener: DisposableActor tag) =>
+    _h.fail("listener failed to bind")
+    _h.complete(true)
 
   fun validate_password(username: String val, password: String val): Bool =>
     false
@@ -113,11 +125,9 @@ actor _PubkeyServerNotify is SshServerNotify
     session.accept_channel(channel_id)
 
   be ssh_session_started(session: SshSession tag) =>
-    // Only one connection is expected; stop listening immediately so a failed
-    // auth exchange can never leave a listener bound to the port (a leaked
-    // listener would block — and silently mis-route — later test runs).
+    // Only one connection is expected; stop accepting once it arrives.
     match _listener
-    | let l: SshListener tag =>
+    | let l: DisposableActor tag =>
       l.dispose()
       _listener = None
     end
@@ -128,7 +138,7 @@ actor _PubkeyServerNotify is SshServerNotify
     if String.from_array(data) == "closeme" then
       session.disconnect()
       match _listener
-      | let l: SshListener tag => l.dispose()
+      | let l: DisposableActor tag => l.dispose()
       end
     end
 

@@ -73,7 +73,7 @@ actor Main
     SshListener(auth, config, MyServerNotify(env))
 ```
 
-Your `MyServerNotify` implements `SshServerNotify`. Authentication and authorization **deny by default**: implement `validate_password` / `validate_publickey` to accept credentials, and override the channel/shell callbacks to grant access (they reject unless overridden).
+Your `MyServerNotify` implements `SshServerNotify`. The listener reports its bind outcome to it through `ssh_listener_started` and `ssh_listener_failed`; a client started before `ssh_listener_started` can be refused. Authentication and authorization **deny by default**: implement `validate_password` / `validate_publickey` to accept credentials, and override the channel/shell callbacks to grant access (they reject unless overridden).
 
 A minimal client:
 
