@@ -18,6 +18,7 @@ primitive \nodoc\ Tests is TestList
     test(_TestKexCurve25519InvalidKey)
     test(_TestKexCurve25519WrongLengthKey)
     test(_TestServerConfigRejectsBadKey)
+    test(_TestListenerBindFailure)
     test(_TestHostKeySignVerify)
     test(_TestHostKeySignVerifyCorrupted)
     test(_TestHostKeyPublicKeySize)

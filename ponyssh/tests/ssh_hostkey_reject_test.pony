@@ -26,21 +26,18 @@ class iso _TestIntegrationHostKeyReject is UnitTest
       else h.fail("invalid host key"); return
       end
 
-    let server_notify = _RejectHostKeyServerNotify(h)
-    let listen_auth = TCPListenAuth(h.env.root)
-    let listener = SshListener(listen_auth, server_config, server_notify)
-    server_notify.set_listener(listener)
-
     let client_config = SshClientConfig("127.0.0.1", "19829",
       "testuser",
       recover val [as SshAuthMethod val: SshPasswordAuth("testpw")] end)
-    let connect_auth = TCPConnectAuth(h.env.root)
-    SshConnector.connect(connect_auth, client_config,
-      _RejectHostKeyClientNotify(h))
+    let server_notify = _RejectHostKeyServerNotify(h,
+      TCPConnectAuth(h.env.root), client_config, _RejectHostKeyClientNotify(h))
+    let listen_auth = TCPListenAuth(h.env.root)
+    h.dispose_when_done(SshListener(listen_auth, server_config, server_notify))
 
 
 actor _RejectHostKeyClientNotify is SshClientNotify
   let _h: TestHelper
+  var _rejected: Bool = false
 
   new create(h: TestHelper) =>
     _h = h
@@ -48,6 +45,7 @@ actor _RejectHostKeyClientNotify is SshClientNotify
   be ssh_verify_host_key(session: SshSession tag, host: String val,
     key: SshHostKey val)
   =>
+    _rejected = true
     session.reject_host_key()
 
   be ssh_ready(session: SshSession tag) =>
@@ -64,22 +62,48 @@ actor _RejectHostKeyClientNotify is SshClientNotify
   be ssh_channel_error(session: SshSession tag, channel_id: U32,
     err: SshChannelError val) => None
   be ssh_channel_closed(session: SshSession tag, channel_id: U32) => None
-  be ssh_error(session: SshSession tag, err: SshTransportError val) => None
+
+  be ssh_error(session: SshSession tag, err: SshTransportError val) =>
+    // Rejecting the host key is reported as a key-exchange failure. Any other
+    // error means the session ended for a reason this test did not cause.
+    match err
+    | let _: SshKexFailed => None
+    else
+      _h.fail("client error: " + err.string())
+      _h.complete(true)
+    end
 
   be ssh_disconnected(session: SshSession tag) =>
-    // Expected: rejection tore the connection down before authentication.
+    // Expected: rejection tore the connection down before authentication. A
+    // key exchange that failed before the host key was offered also ends
+    // here, so the test passes only if the rejection is what ended it.
+    _h.assert_true(_rejected,
+      "the session ended before the host key was offered for verification")
     _h.complete(true)
 
 
 actor _RejectHostKeyServerNotify is SshServerNotify
   let _h: TestHelper
-  var _listener: (SshListener tag | None) = None
+  let _connect_auth: TCPConnectAuth
+  let _client_config: SshClientConfig val
+  let _client_notify: SshClientNotify tag
+  var _listener: (DisposableActor tag | None) = None
 
-  new create(h: TestHelper) =>
+  new create(h: TestHelper, connect_auth: TCPConnectAuth,
+    client_config: SshClientConfig val, client_notify: SshClientNotify tag)
+  =>
     _h = h
+    _connect_auth = connect_auth
+    _client_config = client_config
+    _client_notify = client_notify
 
-  be set_listener(listener: SshListener tag) =>
+  be ssh_listener_started(listener: DisposableActor tag) =>
     _listener = listener
+    SshConnector.connect(_connect_auth, _client_config, _client_notify)
+
+  be ssh_listener_failed(listener: DisposableActor tag) =>
+    _h.fail("listener failed to bind")
+    _h.complete(true)
 
   // Accept any credential. This is only ever consulted if the client proceeded
   // to auth — which means the host-key gate failed. Accepting makes the
@@ -91,10 +115,13 @@ actor _RejectHostKeyServerNotify is SshServerNotify
     pk: SshAuthPublicKeyData val): Bool => true
 
   be ssh_session_started(session: SshSession tag) =>
-    // Only one connection is expected; stop listening so the runtime can
-    // quiesce regardless of how the rejected handshake unwinds.
+    // Only one connection is expected; stop accepting once it arrives.
     match _listener
-    | let l: SshListener tag =>
+    | let l: DisposableActor tag =>
       l.dispose()
       _listener = None
     end
+
+  be ssh_error(session: SshSession tag, err: SshTransportError val) =>
+    _h.fail("server error: " + err.string())
+    _h.complete(true)

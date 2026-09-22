@@ -33,10 +33,21 @@ actor Main
       else env.out.print("Invalid host key; aborting."); return
       end
     let auth = TCPListenAuth(env.root)
-    SshListener(auth, config, EchoServerNotify)
+    SshListener(auth, config, EchoServerNotify(env))
 
 actor EchoServerNotify is SshServerNotify
+  let _env: Env
   let _authorized_key: Array[U8] val = _AuthorizedKey()
+
+  new create(env: Env) =>
+    _env = env
+
+  be ssh_listener_started(listener: DisposableActor tag) =>
+    _env.out.print("Listening.")
+
+  be ssh_listener_failed(listener: DisposableActor tag) =>
+    _env.out.print("Could not bind port 2222; is another server using it?")
+    _env.exitcode(1)
 
   fun validate_password(user: String val, password: String val): Bool =>
     // Don't do this™
