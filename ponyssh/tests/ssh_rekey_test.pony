@@ -65,6 +65,9 @@ actor _RekeyClientNotify is SshClientNotify
     session.rekey()
     session.channel_send(channel_id, "ping".array())
 
+  be ssh_channel_request_result(session: SshSession tag, channel_id: U32,
+    accepted: Bool) => None
+
   be ssh_channel_data(session: SshSession tag, channel_id: U32,
     data: Array[U8] val)
   =>

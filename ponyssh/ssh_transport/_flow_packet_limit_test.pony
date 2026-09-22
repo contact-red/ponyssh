@@ -91,6 +91,9 @@ actor \nodoc\ _FlowLimitClient is SshClientNotify
     session._flow_stop_after_next_packet(channel_id)
     session.channel_send(channel_id, _data)
 
+  be ssh_channel_request_result(session: SshSession tag, channel_id: U32,
+    accepted: Bool) => None
+
   be ssh_channel_send_result(session: SshSession tag, channel_id: U32,
     data: Array[U8] val, accepted: USize, outcome: SshSendOutcome)
   =>

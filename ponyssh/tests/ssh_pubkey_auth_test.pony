@@ -74,6 +74,9 @@ actor _PubkeyClientNotify is SshClientNotify
   be ssh_channel_opened(session: SshSession tag, channel_id: U32) =>
     session.channel_send(channel_id, "closeme".array())
 
+  be ssh_channel_request_result(session: SshSession tag, channel_id: U32,
+    accepted: Bool) => None
+
   be ssh_channel_data(session: SshSession tag, channel_id: U32,
     data: Array[U8] val) => None
   be ssh_channel_error(session: SshSession tag, channel_id: U32,
