@@ -1,5 +1,6 @@
 use "pony_test"
 use "tests"
+use transport = "ssh_transport"
 
 actor \nodoc\ Main is TestList
   new create(env: Env) =>
@@ -10,3 +11,4 @@ actor \nodoc\ Main is TestList
 
   fun tag tests(test: PonyTest) =>
     Tests.tests(test)
+    transport.Main.make().tests(test)

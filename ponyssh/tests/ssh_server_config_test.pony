@@ -24,3 +24,25 @@ class iso _TestServerConfigRejectsBadKey is UnitTest
     else
       h.fail("a valid host key should construct")
     end
+
+class \nodoc\ iso _TestServerConfigChannelWindow is UnitTest
+  fun name(): String => "ssh_transport/server_config/channel_window"
+
+  fun apply(h: TestHelper) =>
+    for size in [as U32: 0; 255].values() do
+      try
+        SshServerConfig(_TestEd25519Pem(), "127.0.0.1", "22"
+          where channel_window' = size)?
+        h.fail("undersized channel window accepted")
+      end
+    end
+
+    try
+      let config = SshServerConfig(_TestEd25519Pem(), "127.0.0.1", "22"
+        where channel_window' = 256)?
+      h.assert_eq[U32](256, config.channel_window)
+      let default_config = SshServerConfig(_TestEd25519Pem())?
+      h.assert_eq[U32](0x200000, default_config.channel_window)
+    else
+      h.fail("valid channel window rejected")
+    end

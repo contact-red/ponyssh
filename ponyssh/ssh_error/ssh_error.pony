@@ -108,6 +108,19 @@ class val SshChannelOpenFailed is Stringable
   fun string(): String iso^ =>
     ("channel open failed (" + reason_code.string() + "): " + description).clone()
 
+class val SshChannelUnsupportedPacketSize is Stringable
+  """A peer advertised a channel packet size below the supported minimum."""
+  let advertised: U32
+  let minimum: U32
+  new val create(advertised': U32, minimum': U32) =>
+    """Both sizes remain available for caller inspection."""
+    advertised = advertised'
+    minimum = minimum'
+  fun string(): String iso^ =>
+    """Include both sizes in the error message."""
+    ("peer channel packet size " + advertised.string() +
+      " is below minimum " + minimum.string()).clone()
+
 primitive SshChannelClosed is Stringable
   fun string(): String iso^ => "channel closed".clone()
 
@@ -116,5 +129,6 @@ primitive SshWindowExhausted is Stringable
 
 type SshChannelError is
   ( SshChannelOpenFailed
+  | SshChannelUnsupportedPacketSize
   | SshChannelClosed
   | SshWindowExhausted )

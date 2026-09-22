@@ -71,7 +71,8 @@ class iso _TestChannelAcceptAndWindow is UnitTest
 
   fun apply(h: TestHelper) =>
     let mgr: SshChannelManager ref = SshChannelManager
-    let local = mgr.accept_channel(0, 5, 0x100000, 0x8000, "session")
+    let local = _AcceptedChannel(h,
+      mgr.accept_channel(0, 5, 0x100000, 0x8000, "session"))
     h.assert_eq[USize](1, mgr.channel_count())
     match mgr.get(local)
     | let ch: SshChannelState => h.assert_eq[U32](5, ch.remote_id)
@@ -90,7 +91,8 @@ class iso _TestChannelWindowExhausted is UnitTest
 
   fun apply(h: TestHelper) =>
     let mgr: SshChannelManager ref = SshChannelManager
-    let local = mgr.accept_channel(0, 7, 0x100000, 0x8000, "session")
+    let local = _AcceptedChannel(h,
+      mgr.accept_channel(0, 7, 0x100000, 0x8000, "session"))
     let over = SshChannelWindow.initial().usize() + 1
     match mgr.channel_data_received(local, over)
     | let _: U32 => h.fail("over-window receive must be rejected")
@@ -107,7 +109,8 @@ class iso _TestChannelReplenish is UnitTest
 
   fun apply(h: TestHelper) =>
     let mgr: SshChannelManager ref = SshChannelManager
-    let local = mgr.accept_channel(0, 9, 0x100000, 0x8000, "session")
+    let local = _AcceptedChannel(h,
+      mgr.accept_channel(0, 9, 0x100000, 0x8000, "session"))
     let initial = SshChannelWindow.initial()
 
     // Above half: no adjustment due.

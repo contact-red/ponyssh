@@ -20,7 +20,16 @@ interface SshClientNotify
   be ssh_channel_error(session: SshSession tag, channel_id: U32, err: SshChannelError val)
   be ssh_channel_send_result(session: SshSession tag, channel_id: U32,
     data: Array[U8] val, accepted: USize, outcome: SshSendOutcome)
+    """
+    Reports one result for each channel_send call. accepted counts the prefix
+    admitted locally. data is the original submitted array. A blocked suffix
+    remains the caller's responsibility.
+    """
   be ssh_channel_window_available(session: SshSession tag, channel_id: U32)
+    """
+    The peer granted credit after a blocked send. The hint is sent once until
+    another send blocks; it does not reserve credit for a retry.
+    """
   be ssh_channel_closed(session: SshSession tag, channel_id: U32)
   be ssh_error(session: SshSession tag, err: SshTransportError val)
   be ssh_disconnected(session: SshSession tag)
@@ -113,7 +122,16 @@ interface SshServerNotify
     err: SshChannelError val) => None
   be ssh_channel_send_result(session: SshSession tag, channel_id: U32,
     data: Array[U8] val, accepted: USize, outcome: SshSendOutcome)
+    """
+    Reports one result for each channel_send call. accepted counts the prefix
+    admitted locally. data is the original submitted array. A blocked suffix
+    remains the caller's responsibility.
+    """
   be ssh_channel_window_available(session: SshSession tag, channel_id: U32)
+    """
+    The peer granted credit after a blocked send. The hint is sent once until
+    another send blocks; it does not reserve credit for a retry.
+    """
   be ssh_channel_closed(session: SshSession tag, channel_id: U32) => None
   be ssh_error(session: SshSession tag, err: SshTransportError val) => None
   be ssh_disconnected(session: SshSession tag) => None

@@ -38,7 +38,8 @@ actor Main
 actor EchoServerNotify is SshServerNotify
   let _env: Env
   let _authorized_key: Array[U8] val = _AuthorizedKey()
-  let _pending: Map[U32, Array[U8] val] = Map[U32, Array[U8] val]
+  let _output: MapIs[SshSession tag, _EchoSessionOutput] =
+    MapIs[SshSession tag, _EchoSessionOutput]
 
   new create(env: Env) =>
     _env = env
@@ -70,6 +71,16 @@ actor EchoServerNotify is SshServerNotify
   be ssh_shell_request(session: SshSession tag, channel_id: U32,
     want_reply: Bool)
   =>
+    let output = try _output(session)? else
+      let created: _EchoSessionOutput ref = _EchoSessionOutput
+      _output(session) = created
+      created
+    end
+    if output.started.contains(channel_id) then
+      if want_reply then session.reject_request(channel_id) end
+      return
+    end
+    output.started(channel_id) = true
     if want_reply then session.accept_request(channel_id) end
     // Paint a splash of colour on the client's terminal. We emit ANSI escapes
     // directly (the xterm-256color 38;5;N foreground select), which every
@@ -85,29 +96,40 @@ actor EchoServerNotify is SshServerNotify
       s
     end
     let data = splash.array()
-    _pending(channel_id) = data
+    output.pending(channel_id) = data
     session.channel_send(channel_id, data)
 
   be ssh_channel_send_result(session: SshSession tag, channel_id: U32,
     data: Array[U8] val, accepted: USize, outcome: SshSendOutcome)
   =>
-    match outcome
-    | SshSendComplete => try _pending.remove(channel_id)? end
-    | SshSendWindowBlocked => _pending(channel_id) = data.trim(accepted)
-    else
-      try _pending.remove(channel_id)? end
+    try
+      let pending = _output(session)?.pending
+      match outcome
+      | SshSendWindowBlocked => pending(channel_id) = data.trim(accepted)
+      else pending.remove(channel_id)?
+      end
     end
 
   be ssh_channel_window_available(session: SshSession tag,
     channel_id: U32)
   =>
-    try session.channel_send(channel_id, _pending(channel_id)?) end
+    try
+      session.channel_send(channel_id, _output(session)?.pending(channel_id)?)
+    end
 
   be ssh_channel_closed(session: SshSession tag, channel_id: U32) =>
-    try _pending.remove(channel_id)? end
+    try
+      let output = _output(session)?
+      try output.pending.remove(channel_id)? end
+      try output.started.remove(channel_id)? end
+    end
 
   be ssh_disconnected(session: SshSession tag) =>
-    _pending.clear()
+    try _output.remove(session)? end
+
+class _EchoSessionOutput
+  let pending: Map[U32, Array[U8] val] = Map[U32, Array[U8] val]
+  let started: Map[U32, Bool] = Map[U32, Bool]
 
 primitive _EchoServerKey
   fun apply(): Array[U8] val =>

@@ -16,3 +16,4 @@ primitive SshSendTooLarge
 type SshSendOutcome is
   (SshSendComplete | SshSendWindowBlocked | SshSendNotReady |
     SshSendClosed | SshSendTooLarge)
+  """Whether channel_send admitted all data or why it stopped."""

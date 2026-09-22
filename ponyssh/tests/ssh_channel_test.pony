@@ -3,6 +3,17 @@ use "../ssh_connection"
 use "../ssh_transport"
 use "../ssh_error"
 
+primitive \nodoc\ _AcceptedChannel
+  fun apply(h: TestHelper,
+    result: (U32 | SshChannelUnsupportedPacketSize)): U32
+  =>
+    match result
+    | let id: U32 => id
+    | let err: SshChannelUnsupportedPacketSize =>
+      h.fail("valid channel open rejected: " + err.string())
+      0
+    end
+
 class iso _TestChannelOpenAndConfirm is UnitTest
   fun name(): String => "ssh_channel/open_and_confirm"
 
@@ -29,48 +40,85 @@ class iso _TestChannelOpenAndConfirm is UnitTest
     | None => h.fail("channel not found after confirm")
     end
 
-class iso _TestChannelMaxPacketSizeClamped is UnitTest
+class \nodoc\ iso _TestChannelPeerPacketSizeBoundary is UnitTest
   """
-  max_packet_size arrives as a peer-controlled uint32 on CHANNEL_OPEN and
-  CHANNEL_OPEN_CONFIRMATION, and it divides our outbound channel data. A peer
-  advertising 1 makes every byte of application output its own SSH packet — 36
-  bytes on the wire and a full AEAD operation per byte, from a single 4-byte
-  field. A peer advertising more than the transport's own packet limit makes us
-  frame packets our own reader would reject. Both ends are clamped when the
-  value is stored, so _channel_send_segmented can divide by it without
-  re-checking.
+  Peer packet limits below 256 are rejected. Larger limits are preserved up to
+  the transport's 32768-byte payload cap.
   """
-  fun name(): String => "ssh_channel/max_packet_size_clamped"
+  fun name(): String => "ssh_channel/peer_packet_size_boundary"
 
   fun apply(h: TestHelper) =>
-    // (advertised, expected) — the boundaries are the clamp's own bounds: 256 is
-    // the floor, 32768 the RFC 4253 §6.1 payload every implementation accepts.
     let cases: Array[(U32, U32)] val =
-      [ (0, 256); (1, 256); (255, 256); (256, 256)
-        (257, 257); (4096, 4096); (32767, 32767); (32768, 32768)
+      [ (256, 256); (257, 257); (4096, 4096); (32767, 32767)
+        (32768, 32768)
         (32769, 32768); (100000, 32768); (U32.max_value(), 32768) ]
 
     for (advertised, expected) in cases.values() do
-      // The accept path: the peer opened the channel and named the value.
       let accept_mgr: SshChannelManager ref = SshChannelManager
-      let accepted = accept_mgr.accept_channel(0, 7, 0x100000, advertised,
-        "session")
+      let accepted = _AcceptedChannel(h,
+        accept_mgr.accept_channel(0, 7, 0x100000, advertised, "session"))
       match accept_mgr.get(accepted)
       | let ch: SshChannelState =>
-        h.assert_eq[U32](expected, ch.max_packet_size,
-          "accept_channel did not clamp " + advertised.string())
+        h.assert_eq[U32](expected, ch.max_packet_size)
       | None => h.fail("accepted channel not found")
       end
 
-      // The confirm path: we opened the channel and the peer named the value.
       let confirm_mgr: SshChannelManager ref = SshChannelManager
       let opened = confirm_mgr.open_channel("session")
-      confirm_mgr.confirm_channel(opened, 7, 0x100000, advertised)
+      match confirm_mgr.confirm_channel(opened, 7, 0x100000, advertised)
+      | None => None
+      | let err: SshChannelError => h.fail(err.string())
+      end
       match confirm_mgr.get(opened)
       | let ch: SshChannelState =>
-        h.assert_eq[U32](expected, ch.max_packet_size,
-          "confirm_channel did not clamp " + advertised.string())
+        h.assert_eq[U32](expected, ch.max_packet_size)
       | None => h.fail("confirmed channel not found")
+      end
+    end
+
+    for advertised in [as U32: 0; 1; 128; 255].values() do
+      let accept_mgr: SshChannelManager ref = SshChannelManager
+      match accept_mgr.accept_channel(0, 7, 0x100000, advertised, "session")
+      | let _: U32 => h.fail("unsupported incoming packet size accepted")
+      | let err: SshChannelUnsupportedPacketSize =>
+        h.assert_eq[U32](advertised, err.advertised)
+      end
+      h.assert_eq[USize](0, accept_mgr.channel_count())
+
+      let confirm_mgr: SshChannelManager ref = SshChannelManager
+      let opened = confirm_mgr.open_channel("session")
+      match confirm_mgr.confirm_channel(opened, 7, 0x100000, advertised)
+      | let err: SshChannelUnsupportedPacketSize =>
+        h.assert_eq[U32](advertised, err.advertised)
+      | None => h.fail("unsupported confirmation accepted")
+      | let err: SshChannelError => h.fail(err.string())
+      end
+      match confirm_mgr.get(opened)
+      | let ch: SshChannelState => h.assert_false(ch.authorized)
+      | None => h.fail("pending channel missing after rejection")
+      end
+    end
+
+class \nodoc\ iso _TestChannelCustomReceiveWindow is UnitTest
+  fun name(): String => "ssh_channel/custom_receive_window"
+
+  fun apply(h: TestHelper) =>
+    let mgr: SshChannelManager ref = SshChannelManager(1024)
+    let incoming = _AcceptedChannel(h,
+      mgr.accept_channel(0, 7, 1024, 256, "session"))
+    let outgoing = mgr.open_channel("session")
+    for id in [as U32: incoming; outgoing].values() do
+      match mgr.get(id)
+      | let ch: SshChannelState => h.assert_eq[U32](1024, ch.local_window)
+      | None => h.fail("channel not allocated")
+      end
+      match mgr.channel_data_received(id, 600)
+      | let remaining: U32 => h.assert_eq[U32](424, remaining)
+      | let err: SshChannelError => h.fail(err.string())
+      end
+      match mgr.replenish_local_window(id)
+      | let increment: U32 => h.assert_eq[U32](600, increment)
+      | None => h.fail("custom window not replenished")
       end
     end
 
@@ -88,7 +136,8 @@ class iso _TestChannelAuthorizedOnlyAfterDecision is UnitTest
   fun apply(h: TestHelper) =>
     // Inbound: allocated unauthorized, and nothing in the manager grants it.
     let inbound: SshChannelManager ref = SshChannelManager
-    let accepted = inbound.accept_channel(0, 7, 0x100000, 0x8000, "session")
+    let accepted = _AcceptedChannel(h,
+      inbound.accept_channel(0, 7, 0x100000, 0x8000, "session"))
     match inbound.get(accepted)
     | let ch: SshChannelState =>
       h.assert_false(ch.authorized,
@@ -123,11 +172,10 @@ class iso _TestChannelDataSendWindowTracking is UnitTest
     mgr.confirm_channel(local_id, 10, 100, 0x8000)
 
     // Send 50 bytes — should succeed, window goes from 100 to 50
-    match mgr.channel_data_send(local_id, 50)
-    | let remote_id: U32 =>
-      h.assert_eq[U32](10, remote_id)
+    match mgr.channel_data_admitted(local_id, 50)
+    | None => None
     | let e: SshChannelError =>
-      h.fail("expected remote_id, got error: " + e.string())
+      h.fail("expected admission, got error: " + e.string())
     end
 
     match mgr.get(local_id)
@@ -136,8 +184,8 @@ class iso _TestChannelDataSendWindowTracking is UnitTest
     end
 
     // Send 60 bytes — should fail with SshWindowExhausted (window is 50)
-    match mgr.channel_data_send(local_id, 60)
-    | let remote_id: U32 => h.fail("expected SshWindowExhausted, got remote_id")
+    match mgr.channel_data_admitted(local_id, 60)
+    | None => h.fail("expected SshWindowExhausted")
     | SshWindowExhausted => None
     | let e: SshChannelError =>
       h.fail("expected SshWindowExhausted, got: " + e.string())
@@ -152,11 +200,10 @@ class iso _TestChannelDataSendWindowTracking is UnitTest
     end
 
     // Now send 60 bytes — should succeed
-    match mgr.channel_data_send(local_id, 60)
-    | let remote_id: U32 =>
-      h.assert_eq[U32](10, remote_id)
+    match mgr.channel_data_admitted(local_id, 60)
+    | None => None
     | let e: SshChannelError =>
-      h.fail("expected remote_id after window adjust, got: " + e.string())
+      h.fail("expected admission after window adjust, got: " + e.string())
     end
 
 class iso _TestChannelClose is UnitTest
@@ -173,11 +220,48 @@ class iso _TestChannelClose is UnitTest
 
     h.assert_eq[USize](0, mgr.channel_count())
 
-    match mgr.channel_data_send(local_id, 10)
+    match mgr.channel_remote_id_if_open(local_id)
     | let remote_id: U32 => h.fail("expected SshChannelClosed, got remote_id")
     | SshChannelClosed => None
     | let e: SshChannelError =>
       h.fail("expected SshChannelClosed, got: " + e.string())
+    end
+
+class \nodoc\ iso _TestChannelPostAdmissionDebit is UnitTest
+  fun name(): String => "ssh_channel/post_admission_debit"
+
+  fun apply(h: TestHelper) =>
+    let mgr: SshChannelManager ref = SshChannelManager
+    let id = mgr.open_channel("session")
+    mgr.confirm_channel(id, 10, 100, 256)
+
+    match mgr.channel_data_admitted(id, 60)
+    | None => None
+    | let err: SshChannelError =>
+      h.fail("admission debit failed: " + err.string())
+    end
+    match mgr.get(id)
+    | let ch: SshChannelState => h.assert_eq[U32](40, ch.remote_window)
+    | None => h.fail("confirmed channel missing")
+    end
+
+    match mgr.channel_data_admitted(id, 41)
+    | SshWindowExhausted => None
+    | None => h.fail("debit exceeded the peer window")
+    | let err: SshChannelError => h.fail("wrong debit error: " + err.string())
+    end
+    match mgr.get(id)
+    | let ch: SshChannelState => h.assert_eq[U32](40, ch.remote_window)
+    | None => h.fail("confirmed channel missing")
+    end
+
+    if USize.max_value() > U32.max_value().usize() then
+      match mgr.channel_data_admitted(id, USize.max_value())
+      | SshWindowExhausted => None
+      | None => h.fail("oversized debit wrapped to a small count")
+      | let err: SshChannelError =>
+        h.fail("wrong oversized debit error: " + err.string())
+      end
     end
 
 class iso _TestChannelCapacity is UnitTest

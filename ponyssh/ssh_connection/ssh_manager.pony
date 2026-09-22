@@ -2,7 +2,7 @@ use "collections"
 use "../ssh_error"
 
 primitive SshChannelWindow
-  """The receive window ponyssh advertises for each channel it opens/accepts."""
+  """The default receive window advertised for a channel."""
   fun initial(): U32 => 0x200000  // 2 MiB
 
 primitive SshChannelLimits
@@ -12,20 +12,15 @@ primitive SshChannelLimits
   """
   fun max_concurrent(): USize =>
     """
-    Maximum number of channels held at once. Each accepted CHANNEL_OPEN
-    allocates state advertising a 2 MiB window; without a cap a peer flooding
-    CHANNEL_OPEN could exhaust memory. 256 is generous for legitimate use.
+    Maximum number of channels held at once. A peer that repeatedly opens
+    channels must not grow stored channel state without bound.
     """
     256
 
   fun min_max_packet(): U32 =>
     """
-    Floor for a peer's advertised channel packet size. The peer picks this value
-    off the wire, and it divides our outbound data: at 1 byte per packet each
-    byte of application output costs a 36-byte frame and a full AEAD operation.
-    256 keeps that overhead bounded while staying far below any size a real
-    implementation asks for, and well inside the 32768-byte payload RFC 4253
-    §6.1 requires every implementation to accept.
+    Minimum peer channel packet size accepted by this implementation. Smaller
+    limits would require too many outbound packets per application send.
     """
     256
 
@@ -37,9 +32,13 @@ primitive SshChannelLimits
     """
     32768
 
-  fun clamp_max_packet(value: U32): U32 =>
-    """Bring a peer-advertised channel packet size within the bounds above."""
-    value.max(min_max_packet()).min(max_max_packet())
+  fun supported_max_packet(value: U32): Bool =>
+    """Whether a peer's packet size meets the supported minimum."""
+    value >= min_max_packet()
+
+  fun cap_max_packet(value: U32): U32 =>
+    """Cap an accepted peer packet size to the transport's payload limit."""
+    value.min(max_max_packet())
 
 class SshChannelManager
   """
@@ -53,13 +52,17 @@ class SshChannelManager
   invariant, or inbound routing will look up the wrong channel.
   """
   var _next_local_id: U32 = 0
+  let initial_window: U32
   let _channels: Map[U32, SshChannelState] = Map[U32, SshChannelState]
+
+  new create(initial_window': U32 = SshChannelWindow.initial()) =>
+    """The receive window is at least 256 bytes, even for smaller inputs."""
+    initial_window = initial_window'.max(SshChannelLimits.min_max_packet())
 
   fun ref open_channel(channel_type: String val): U32 =>
     """Allocate local channel ID and create pending state."""
     let id = _next_local_id
     _next_local_id = _next_local_id + 1
-    let initial_window: U32 = SshChannelWindow.initial()
     _channels(id) = SshChannelState(id, 0, initial_window, 0, 0, channel_type)
     id
 
@@ -72,9 +75,13 @@ class SshChannelManager
     """
     try
       let ch = _channels(local_id)?
+      if not SshChannelLimits.supported_max_packet(max_packet_size) then
+        return SshChannelUnsupportedPacketSize(max_packet_size,
+          SshChannelLimits.min_max_packet())
+      end
       ch.remote_id = remote_id
       ch.remote_window = remote_window
-      ch.max_packet_size = SshChannelLimits.clamp_max_packet(max_packet_size)
+      ch.max_packet_size = SshChannelLimits.cap_max_packet(max_packet_size)
       ch.authorized = true
       None
     else
@@ -82,53 +89,56 @@ class SshChannelManager
     end
 
   fun ref accept_channel(local_id: U32, remote_id: U32,
-    remote_window: U32, max_packet_size: U32, channel_type: String val): U32
+    remote_window: U32, max_packet_size: U32, channel_type: String val):
+    (U32 | SshChannelUnsupportedPacketSize)
   =>
     """Accept an incoming channel open from remote (server side)."""
+    if not SshChannelLimits.supported_max_packet(max_packet_size) then
+      return SshChannelUnsupportedPacketSize(max_packet_size,
+        SshChannelLimits.min_max_packet())
+    end
     let id = _next_local_id
     _next_local_id = _next_local_id + 1
-    let initial_window: U32 = SshChannelWindow.initial()
     _channels(id) = SshChannelState(id, remote_id, initial_window,
-      remote_window, max_packet_size, channel_type)
+      remote_window, SshChannelLimits.cap_max_packet(max_packet_size),
+      channel_type)
     id
 
-  fun ref channel_data_send(local_id: U32, data_size: USize):
+  fun box channel_remote_id_if_open(local_id: U32):
     (U32 | SshChannelError)
   =>
-    """Check window allows sending, return remote channel ID. Caller handles framing."""
+    """Return the peer's channel ID when the local channel is open."""
     try
       let ch = _channels(local_id)?
       if not ch.open then return SshChannelClosed end
-      if ch.remote_window < data_size.u32() then return SshWindowExhausted end
-      ch.remote_window = ch.remote_window - data_size.u32()
       ch.remote_id
     else
       SshChannelClosed
     end
 
-  fun ref channel_send_candidate(local_id: U32):
-    (SshChannelState ref | SshChannelError)
+  fun ref channel_data_admitted(local_id: U32, data_size: USize):
+    (None | SshChannelError)
   =>
-    """Return an authorized channel for a data send or local close."""
+    """Debit the peer window after a segment has been admitted to transport."""
     try
       let ch = _channels(local_id)?
       if (not ch.open) or (not ch.authorized) then
         return SshChannelClosed
       end
-      ch
+      if data_size > U32.max_value().usize() then
+        return SshWindowExhausted
+      end
+      if ch.remote_window < data_size.u32() then
+        return SshWindowExhausted
+      end
+      ch.remote_window = ch.remote_window - data_size.u32()
+      None
     else
       SshChannelClosed
     end
 
-  fun ref channel_data_admitted(local_id: U32, data_size: USize) =>
-    """Debit the peer window after a segment has been admitted to transport."""
-    try
-      let ch = _channels(local_id)?
-      ch.remote_window = ch.remote_window - data_size.u32()
-    end
-
   fun ref clear_send_blocked() =>
-    """Release all pending window hints when the session ends."""
+    """Clear blocked-send state when the session ends."""
     for ch in _channels.values() do ch.send_blocked = false end
 
   fun ref channel_data_received(local_id: U32, data_size: USize):
@@ -158,7 +168,7 @@ class SshChannelManager
     """
     try
       let ch = _channels(local_id)?
-      let initial = SshChannelWindow.initial()
+      let initial = initial_window
       if ch.local_window < (initial / 2) then
         let increment = initial - ch.local_window
         ch.local_window = ch.local_window + increment

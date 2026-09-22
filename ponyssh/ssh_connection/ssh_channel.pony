@@ -3,10 +3,8 @@ class SshChannelState
   var remote_id: U32
   var local_window: U32
   var remote_window: U32
-  // Always within SshChannelLimits' bounds: clamped here at construction and on
-  // every later assignment. SshSession._channel_send_segmented divides outbound
-  // data by this value, so a zero would not terminate and a one would frame one
-  // SSH packet — 36 bytes and an AEAD operation — per byte of output.
+  // Locally opened channels hold zero until confirmed. Authorized channels
+  // have a positive peer limit validated by SshChannelManager.
   var max_packet_size: U32
   let channel_type: String val
   var open: Bool = true
@@ -28,5 +26,5 @@ class SshChannelState
     remote_id = remote_id'
     local_window = local_window'
     remote_window = remote_window'
-    max_packet_size = SshChannelLimits.clamp_max_packet(max_packet_size')
+    max_packet_size = max_packet_size'
     channel_type = channel_type'
