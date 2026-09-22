@@ -67,6 +67,7 @@ All notable changes to this project will be documented in this file. This projec
 - More OpenSSL return codes are checked and fail closed: the AEAD decrypt
   update, the HMAC computation, and raw public-key extraction no longer ignore
   a failure from the library.
+- Report channel-send progress so callers can retry after window exhaustion ([PR #14](https://github.com/contact-red/ponyssh/pull/14))
 
 ### Added
 
