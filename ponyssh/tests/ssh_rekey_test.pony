@@ -25,8 +25,9 @@ class iso _TestIntegrationRekey is UnitTest
 
     let pem = _TestEd25519Pem()
     let server_config =
-      try SshServerConfig(pem, "127.0.0.1", "19830")?
-      else h.fail("invalid host key"); return
+      match MakeSshServerConfig(pem, "127.0.0.1", "19830")
+      | let config: SshServerConfig val => config
+      | let err: SshServerConfigError => h.fail(err.string()); return
       end
 
     let client_config = SshClientConfig("127.0.0.1", "19830",

@@ -22,7 +22,7 @@ This requires ponyc 0.72.0 or later, the first release that ships `net`.
 
 `channel_send` could transmit only the prefix that fit the peer's window and discard the rest. It now reports the number of bytes admitted locally for every call. When the window blocks a send, retain the unsent suffix and retry it after `ssh_channel_window_available`. Each call is limited to 32768 bytes. Both client and server notify implementations must add `ssh_channel_send_result` and `ssh_channel_window_available` callbacks.
 
-Peer-advertised channel packet limits below 256 bytes are now rejected instead of sending packets larger than that limit. `SshServerConfig` also accepts an optional `channel_window` value to control the receive window advertised to clients; the default remains 2 MiB, and values below 256 bytes are rejected.
+Peer-advertised channel packet limits below 256 bytes are now rejected instead of sending packets larger than that limit. `MakeSshServerConfig` also accepts an optional `channel_window'` value to control the receive window advertised to clients; the default remains 2 MiB, and values below 256 bytes are rejected.
 
 Before:
 

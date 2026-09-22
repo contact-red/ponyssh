@@ -30,6 +30,31 @@ type SshCryptoError is
   | SshKeyInvalid
   | SshOpenSSLError )
 
+primitive SshServerHostKeyLoadFailed is Stringable
+  """The server host key PEM could not be loaded."""
+  fun string(): String iso^ =>
+    """The message contains no host key bytes."""
+    "server host key could not be loaded".clone()
+
+class val SshServerChannelWindowTooSmall is Stringable
+  """The configured channel receive window is below the supported minimum."""
+  let given: U32
+  let minimum: U32
+
+  new val create(given': U32, minimum': U32) =>
+    """The rejected window and minimum remain available for inspection."""
+    given = given'
+    minimum = minimum'
+
+  fun string(): String iso^ =>
+    """The message includes the rejected window and required minimum."""
+    ("server channel window " + given.string() +
+      " is below minimum " + minimum.string()).clone()
+
+type SshServerConfigError is
+  (SshServerHostKeyLoadFailed | SshServerChannelWindowTooSmall)
+  """A server host key load failure or an undersized channel window."""
+
 primitive SshPacketTooLarge is Stringable
   fun string(): String iso^ => "packet too large".clone()
 

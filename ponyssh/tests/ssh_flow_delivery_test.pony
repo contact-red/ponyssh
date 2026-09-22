@@ -17,12 +17,10 @@ class \nodoc\ iso _TestIntegrationFlowDelivery is UnitTest
 
   fun apply(h: TestHelper) =>
     h.long_test(20_000_000_000)
-    let config = try
-      SshServerConfig(_TestEd25519Pem(), "127.0.0.1", "19831"
-        where channel_window' = 1024)?
-    else
-      h.fail("invalid host key")
-      return
+    let config = match MakeSshServerConfig(_TestEd25519Pem(),
+      "127.0.0.1", "19831" where channel_window' = 1024)
+    | let created: SshServerConfig val => created
+    | let err: SshServerConfigError => h.fail(err.string()); return
     end
     let client_config = SshClientConfig("127.0.0.1", "19831",
       "testuser",

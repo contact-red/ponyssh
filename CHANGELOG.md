@@ -39,9 +39,9 @@ All notable changes to this project will be documented in this file. This projec
 - The pre-handshake version-exchange buffer is now bounded, closing an
   unauthenticated remote memory-exhaustion vector where a peer that never sent
   a line terminator could grow it without limit.
-- `SshServerConfig` validates the host key when constructed, so an unparseable
-  key fails at setup rather than silently dropping every connection at key
-  exchange.
+- `MakeSshServerConfig` loads the host key PEM before returning a server
+  configuration, so an unparseable key fails at setup rather than silently
+  dropping every connection at key exchange.
 - `chacha20-poly1305@openssh.com` now interoperates with OpenSSH. It was
   implemented on OpenSSL's IETF `EVP_chacha20_poly1305` AEAD, a different
   construction from the OpenSSH variant (separate length key, length keystream

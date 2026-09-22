@@ -10,11 +10,10 @@ class \nodoc\ iso _TestFlowPacketLimit is UnitTest
 
   fun apply(h: TestHelper) =>
     h.long_test(10_000_000_000)
-    let config = try
-      SshServerConfig(_FlowLimitPem(), "127.0.0.1", "19832")?
-    else
-      h.fail("invalid host key")
-      return
+    let config = match MakeSshServerConfig(_FlowLimitPem(),
+      "127.0.0.1", "19832")
+    | let created: SshServerConfig val => created
+    | let err: SshServerConfigError => h.fail(err.string()); return
     end
     let client = _FlowLimitClient(h, TCPConnectAuth(h.env.root))
     h.dispose_when_done(_FlowLimitListener(TCPListenAuth(h.env.root),

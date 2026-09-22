@@ -51,21 +51,26 @@ A minimal echo server. See [`examples/echo-server`](examples/echo-server) for th
 ```pony
 use "net"
 use "ssh_transport"
+use "ssh_error"
 use "ssh_server"
 
 actor Main
   new create(env: Env) =>
     let pem: Array[U8] val = MyHostKey()  // your host key, PEM-encoded
 
-    // SshServerConfig validates its host key and channel window.
     // Algorithm preferences default to the implemented set; to customise them
     // pass `SshAlgorithmPreferences` with named arguments and override only the
     // categories you need.
     let config =
-      try
-        SshServerConfig(pem, "0.0.0.0", "2222")?
-      else
-        env.out.print("invalid server configuration; aborting")
+      match MakeSshServerConfig(pem, "0.0.0.0", "2222")
+      | let ready: SshServerConfig val => ready
+      | SshServerHostKeyLoadFailed =>
+        env.err.print("server host key could not be loaded")
+        env.exitcode(1)
+        return
+      | let err: SshServerChannelWindowTooSmall =>
+        env.err.print(err.string())
+        env.exitcode(1)
         return
       end
 
@@ -75,7 +80,7 @@ actor Main
 
 Your `MyServerNotify` implements `SshServerNotify`. The listener reports its bind outcome to it through `ssh_listener_started` and `ssh_listener_failed`; a client started before `ssh_listener_started` can be refused. Authentication and authorization **deny by default**: implement `validate_password` / `validate_publickey` to accept credentials, and override the channel/shell callbacks to grant access (they reject unless overridden).
 
-`SshServerConfig` advertises a 2 MiB receive window per channel by default. Set `channel_window'` in its constructor to use another value of at least 256 bytes.
+`MakeSshServerConfig` rejects host key PEM that cannot be loaded and channel receive windows below 256 bytes. The default window is 2 MiB per channel. Set `channel_window'` when calling `MakeSshServerConfig` to use another value.
 
 A minimal client:
 

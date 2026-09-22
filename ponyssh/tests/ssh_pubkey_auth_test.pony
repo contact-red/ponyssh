@@ -36,8 +36,9 @@ class iso _TestIntegrationPubkeyAuth is UnitTest
 
     let server_pem = _TestEd25519Pem()  // host key
     let server_config =
-      try SshServerConfig(server_pem, "127.0.0.1", "19828")?
-      else h.fail("invalid host key"); return
+      match MakeSshServerConfig(server_pem, "127.0.0.1", "19828")
+      | let config: SshServerConfig val => config
+      | let err: SshServerConfigError => h.fail(err.string()); return
       end
 
     // Client authenticates with the ponyssh-testing private key
